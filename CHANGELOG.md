@@ -1,15 +1,12 @@
 # Changelog
 
-## 0.1.0-unreleased
+## 0.1.0 - extraction work in progress
 
-Initial extraction package.
-
-- Named project `turnkey-mcp`.
-- Added Rust-native MCP server primitives.
-- Added typed tool registry and structured response helpers.
-- Added read/write dispatch with serialized mutation worker.
-- Added sidecar/resident-owner primitives derived from Ishoo's MCP transport.
-- Added Claude Code and Codex host adapter helpers.
-- Added language-agnostic manifest structs and documentation.
-- Added exact copied Ishoo source files under `origin/ishoo/` for copy-first provenance.
-- Added `origin/ishoo/SHA256SUMS` for copied source verification.
+- Copy-first extraction package from Ishoo MCP runtime.
+- Added `origin/ishoo/` provenance files.
+- Added Rust-native stdio MCP server, registry, response helpers, sidecar owner, host adapters, and manifest structs.
+- Restored sidecar owner routing in `McpServer::run_stdio()` so the live crate follows Ishoo's `mcp` -> `mcp-owner` pattern instead of handling tool calls only in-process.
+- Added fail-closed owner recovery semantics for mutating calls.
+- Added read fallback annotation for unreachable owners.
+- Restored Unix/Linux parent-death behavior and Windows parent watchdog scaffolding.
+- Updated host readiness and adapter skip behavior closer to Ishoo.

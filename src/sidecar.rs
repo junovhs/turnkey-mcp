@@ -434,7 +434,10 @@ fn current_build_fingerprint(owner_bin_name: &str) -> String {
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0
+    if rc == 0 {
+        return true;
+    }
+    matches!(std::io::Error::last_os_error().raw_os_error(), Some(code) if code == libc::EPERM)
 }
 
 #[cfg(windows)]

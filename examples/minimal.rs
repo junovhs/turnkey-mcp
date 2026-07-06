@@ -11,8 +11,8 @@ fn main() {
                 json!({ "type": "object", "properties": {}, "additionalProperties": false }),
                 |ctx, _args| {
                     Ok(json!({
-                        "app": ctx.app_name,
-                        "workspace": ctx.workspace_root,
+                        "app": ctx.app_name.clone(),
+                        "workspace": ctx.workspace_root.display().to_string(),
                         "ok": true
                     }))
                 },

@@ -1,8 +1,13 @@
 //! Host config adapters for Claude Code and Codex.
 //!
 //! Copy-first extraction source: `origin/ishoo/src/model/adapters.rs`.
-//! The important behavior is explicit install only, no-clobber merges, owned-entry
-//! detection, user/repo scope support, and readiness facts.
+//! The retained behavior is intentionally conservative:
+//! - explicit install only
+//! - repo and user/global scopes
+//! - no-clobber merges
+//! - owned-entry detection before update/remove
+//! - skipped file-level failures instead of whole-run clobbering
+//! - readiness facts that explain effective host setup
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,7 +19,7 @@ use std::path::{Path, PathBuf};
 const MANAGED_BEGIN: &str = "<!-- turnkey-mcp:begin -->";
 const MANAGED_END: &str = "<!-- turnkey-mcp:end -->";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostServer {
     pub name: String,
     pub command: String,
@@ -24,7 +29,11 @@ pub struct HostServer {
 }
 
 impl HostServer {
-    pub fn stdio(name: impl Into<String>, command: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             name: name.into(),
             command: command.into(),
@@ -32,6 +41,11 @@ impl HostServer {
             env: BTreeMap::new(),
             codex_approval_tools: Vec::new(),
         }
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
     }
 
     pub fn approve_tool(mut self, tool_name: impl Into<String>) -> Self {
@@ -77,13 +91,41 @@ impl HostInstall {
         let repo_root = find_git_root(repo_root)
             .ok_or_else(|| "not inside a git repository".to_string())?;
         let mut files = Vec::new();
-        files.push((".mcp.json".to_string(), with_action(&repo_root.join(".mcp.json"), || self.ensure_mcp_json(&repo_root))?));
-        files.push((".codex/config.toml".to_string(), with_action(&repo_root.join(".codex/config.toml"), || self.ensure_codex_repo_config(&repo_root))?));
-        files.push((".claude/settings.local.json".to_string(), with_action(&repo_root.join(".claude/settings.local.json"), || self.ensure_claude_settings(&repo_root))?));
-        files.push((".claude/.gitignore".to_string(), with_action(&repo_root.join(".claude/.gitignore"), || ensure_claude_gitignore(&repo_root))?));
+        files.push((
+            ".mcp.json".to_string(),
+            with_action(&repo_root.join(".mcp.json"), || self.ensure_mcp_json(&repo_root))?,
+        ));
+        files.push((
+            ".codex/config.toml".to_string(),
+            with_action(&repo_root.join(".codex/config.toml"), || {
+                self.ensure_codex_repo_config(&repo_root)
+            })?,
+        ));
+        files.push((
+            ".claude/settings.local.json".to_string(),
+            with_action(&repo_root.join(".claude/settings.local.json"), || {
+                self.ensure_claude_settings(&repo_root)
+            })?,
+        ));
+        files.push((
+            ".claude/.gitignore".to_string(),
+            with_action(&repo_root.join(".claude/.gitignore"), || {
+                ensure_claude_gitignore(&repo_root)
+            })?,
+        ));
         if self.managed_markdown_body.is_some() {
-            files.push(("CLAUDE.md".to_string(), with_action(&repo_root.join("CLAUDE.md"), || self.ensure_managed_markdown(&repo_root.join("CLAUDE.md")))?));
-            files.push(("AGENTS.md".to_string(), with_action(&repo_root.join("AGENTS.md"), || self.ensure_managed_markdown(&repo_root.join("AGENTS.md")))?));
+            files.push((
+                "CLAUDE.md".to_string(),
+                with_action(&repo_root.join("CLAUDE.md"), || {
+                    self.ensure_managed_markdown(&repo_root.join("CLAUDE.md"))
+                })?,
+            ));
+            files.push((
+                "AGENTS.md".to_string(),
+                with_action(&repo_root.join("AGENTS.md"), || {
+                    self.ensure_managed_markdown(&repo_root.join("AGENTS.md"))
+                })?,
+            ));
         }
         Ok(InstallReport { root: repo_root, files })
     }
@@ -91,24 +133,44 @@ impl HostInstall {
     pub fn install_user(&self) -> Result<InstallReport, String> {
         let paths = default_user_config_paths();
         let mut files = Vec::new();
-        files.push((paths.codex_config.display().to_string(), with_action(&paths.codex_config, || self.ensure_codex_user_config(&paths.codex_config))?));
-        files.push((paths.claude_json.display().to_string(), with_action(&paths.claude_json, || self.ensure_claude_user_config(&paths.claude_json))?));
+        files.push((
+            paths.codex_config.display().to_string(),
+            with_action(&paths.codex_config, || self.ensure_codex_user_config(&paths.codex_config))?,
+        ));
+        files.push((
+            paths.claude_json.display().to_string(),
+            with_action(&paths.claude_json, || self.ensure_claude_user_config(&paths.claude_json))?,
+        ));
         Ok(InstallReport { root: paths.home, files })
     }
 
     pub fn remove_user(&self) -> Result<InstallReport, String> {
         let paths = default_user_config_paths();
         let mut files = Vec::new();
-        files.push((paths.codex_config.display().to_string(), with_action(&paths.codex_config, || self.remove_codex_user_config(&paths.codex_config))?));
-        files.push((paths.claude_json.display().to_string(), with_action(&paths.claude_json, || self.remove_claude_user_config(&paths.claude_json))?));
+        files.push((
+            paths.codex_config.display().to_string(),
+            with_action(&paths.codex_config, || self.remove_codex_user_config(&paths.codex_config))?,
+        ));
+        files.push((
+            paths.claude_json.display().to_string(),
+            with_action(&paths.claude_json, || self.remove_claude_user_config(&paths.claude_json))?,
+        ));
         Ok(InstallReport { root: paths.home, files })
     }
 
     pub fn readiness(&self, repo_root: &Path) -> Vec<HostReadinessReport> {
         let paths = default_user_config_paths();
         vec![
-            build_readiness("Claude Code", inspect_claude_config(&paths.claude_json, &self.servers), inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers)),
-            build_readiness("Codex", inspect_codex_config(&paths.codex_config, &self.servers), inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers)),
+            build_readiness(
+                "Claude Code",
+                inspect_claude_config(&paths.claude_json, &self.servers),
+                inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers),
+            ),
+            build_readiness(
+                "Codex",
+                inspect_codex_config(&paths.codex_config, &self.servers),
+                inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers),
+            ),
         ]
     }
 
@@ -121,11 +183,17 @@ impl HostInstall {
                 _ => return Ok(Materialized::Skipped(".mcp.json is not parseable JSON".to_string())),
             },
         };
-        let Some(root) = doc.as_object_mut() else { return Ok(Materialized::Skipped(".mcp.json is not an object".to_string())); };
+        let Some(root) = doc.as_object_mut() else {
+            return Ok(Materialized::Skipped(".mcp.json is not a JSON object".to_string()));
+        };
         let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
-        let Some(servers) = servers.as_object_mut() else { return Ok(Materialized::Skipped(".mcp.json `mcpServers` is not an object".to_string())); };
+        let Some(servers) = servers.as_object_mut() else {
+            return Ok(Materialized::Skipped(".mcp.json `mcpServers` is not an object".to_string()));
+        };
         for server in &self.servers {
-            servers.entry(server.name.clone()).or_insert_with(|| claude_server_json(server));
+            servers
+                .entry(server.name.clone())
+                .or_insert_with(|| claude_server_json(server));
         }
         write_json(&path, &doc)?;
         Ok(Materialized::Wrote)
@@ -135,31 +203,52 @@ impl HostInstall {
         let dir = repo_root.join(".codex");
         let path = dir.join("config.toml");
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        let table = parse_toml_or_skip(&existing, ".codex/config.toml")?;
+        let table = match parse_toml_materialized(&existing, ".codex/config.toml") {
+            Ok(table) => table,
+            Err(skipped) => return Ok(skipped),
+        };
         let mut additions = String::new();
         for server in &self.servers {
             append_codex_server(&table, &mut additions, server);
         }
-        if additions.is_empty() { return Ok(Materialized::Wrote); }
+        if additions.is_empty() {
+            return Ok(Materialized::Wrote);
+        }
         fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
         let mut text = existing;
-        if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
-        if !text.is_empty() { text.push('\n'); }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
         text.push_str(&additions);
-        while text.ends_with("\n\n") { text.pop(); }
+        while text.ends_with("\n\n") {
+            text.pop();
+        }
         fs::write(&path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
         Ok(Materialized::Wrote)
     }
 
     fn ensure_codex_user_config(&self, path: &Path) -> Result<Materialized, String> {
         let existing = fs::read_to_string(path).unwrap_or_default();
-        let mut table = parse_toml_or_skip(&existing, &path.display().to_string())?;
-        let servers = table.entry("mcp_servers".to_string()).or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let Some(servers) = servers.as_table_mut() else { return Ok(Materialized::Skipped("Codex `mcp_servers` is not a table".to_string())); };
+        let mut table = match parse_toml_materialized(&existing, &path.display().to_string()) {
+            Ok(table) => table,
+            Err(skipped) => return Ok(skipped),
+        };
+        let servers = table
+            .entry("mcp_servers".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(servers) = servers.as_table_mut() else {
+            return Ok(Materialized::Skipped("Codex `mcp_servers` is not a table".to_string()));
+        };
         for server in &self.servers {
             if let Some(existing) = servers.get(&server.name) {
                 if !codex_server_is_owned(existing, server) {
-                    return Ok(Materialized::Skipped(format!("Codex already has a non-owned `{}` MCP server", server.name)));
+                    return Ok(Materialized::Skipped(format!(
+                        "Codex already has a non-owned `{}` MCP server; leaving it untouched",
+                        server.name
+                    )));
                 }
             }
             servers.insert(server.name.clone(), codex_server_toml(server));
@@ -169,18 +258,29 @@ impl HostInstall {
     }
 
     fn remove_codex_user_config(&self, path: &Path) -> Result<Materialized, String> {
-        let existing = match fs::read_to_string(path) { Ok(v) => v, Err(_) => return Ok(Materialized::Skipped("not present".to_string())) };
-        let mut table = parse_toml_or_skip(&existing, &path.display().to_string())?;
+        let existing = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => return Ok(Materialized::Skipped("not present".to_string())),
+        };
+        let mut table = match parse_toml_materialized(&existing, &path.display().to_string()) {
+            Ok(table) => table,
+            Err(skipped) => return Ok(skipped),
+        };
         let mut changed = false;
         if let Some(servers) = table.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
             for server in &self.servers {
-                if servers.get(&server.name).is_some_and(|v| codex_server_is_owned(v, server)) {
+                if servers
+                    .get(&server.name)
+                    .is_some_and(|v| codex_server_is_owned(v, server))
+                {
                     servers.remove(&server.name);
                     changed = true;
                 }
             }
         }
-        if changed { write_toml(path, &table)?; }
+        if changed {
+            write_toml(path, &table)?;
+        }
         Ok(Materialized::Wrote)
     }
 
@@ -189,16 +289,28 @@ impl HostInstall {
             Err(_) => json!({ "mcpServers": {} }),
             Ok(existing) => match serde_json::from_str::<Value>(&existing) {
                 Ok(v) if v.is_object() => v,
-                _ => return Ok(Materialized::Skipped(format!("{} is not parseable JSON", path.display()))),
+                _ => {
+                    return Ok(Materialized::Skipped(format!(
+                        "{} is not parseable JSON",
+                        path.display()
+                    )))
+                }
             },
         };
-        let Some(root) = doc.as_object_mut() else { return Ok(Materialized::Skipped("Claude config is not an object".to_string())); };
+        let Some(root) = doc.as_object_mut() else {
+            return Ok(Materialized::Skipped("Claude config is not an object".to_string()));
+        };
         let servers = root.entry("mcpServers").or_insert_with(|| json!({}));
-        let Some(servers) = servers.as_object_mut() else { return Ok(Materialized::Skipped("Claude `mcpServers` is not an object".to_string())); };
+        let Some(servers) = servers.as_object_mut() else {
+            return Ok(Materialized::Skipped("Claude `mcpServers` is not an object".to_string()));
+        };
         for server in &self.servers {
             if let Some(existing) = servers.get(&server.name) {
                 if !claude_server_is_owned(existing, server) {
-                    return Ok(Materialized::Skipped(format!("Claude already has a non-owned `{}` MCP server", server.name)));
+                    return Ok(Materialized::Skipped(format!(
+                        "Claude already has a non-owned `{}` MCP server; leaving it untouched",
+                        server.name
+                    )));
                 }
             }
             servers.insert(server.name.clone(), claude_server_json(server));
@@ -208,21 +320,34 @@ impl HostInstall {
     }
 
     fn remove_claude_user_config(&self, path: &Path) -> Result<Materialized, String> {
-        let existing = match fs::read_to_string(path) { Ok(v) => v, Err(_) => return Ok(Materialized::Skipped("not present".to_string())) };
+        let existing = match fs::read_to_string(path) {
+            Ok(v) => v,
+            Err(_) => return Ok(Materialized::Skipped("not present".to_string())),
+        };
         let mut doc = match serde_json::from_str::<Value>(&existing) {
             Ok(v) if v.is_object() => v,
-            _ => return Ok(Materialized::Skipped(format!("{} is not parseable JSON", path.display()))),
+            _ => {
+                return Ok(Materialized::Skipped(format!(
+                    "{} is not parseable JSON",
+                    path.display()
+                )))
+            }
         };
         let mut changed = false;
         if let Some(servers) = doc.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
             for server in &self.servers {
-                if servers.get(&server.name).is_some_and(|v| claude_server_is_owned(v, server)) {
+                if servers
+                    .get(&server.name)
+                    .is_some_and(|v| claude_server_is_owned(v, server))
+                {
                     servers.remove(&server.name);
                     changed = true;
                 }
             }
         }
-        if changed { write_json(path, &doc)?; }
+        if changed {
+            write_json(path, &doc)?;
+        }
         Ok(Materialized::Wrote)
     }
 
@@ -233,14 +358,24 @@ impl HostInstall {
             Err(_) => json!({ "permissions": { "allow": [] } }),
             Ok(existing) => match serde_json::from_str::<Value>(&existing) {
                 Ok(v) if v.is_object() => v,
-                _ => return Ok(Materialized::Skipped(".claude/settings.local.json is not parseable JSON".to_string())),
+                _ => {
+                    return Ok(Materialized::Skipped(
+                        ".claude/settings.local.json is not parseable JSON".to_string(),
+                    ))
+                }
             },
         };
-        let Some(root) = doc.as_object_mut() else { return Ok(Materialized::Skipped("Claude settings is not an object".to_string())); };
+        let Some(root) = doc.as_object_mut() else {
+            return Ok(Materialized::Skipped("Claude settings is not an object".to_string()));
+        };
         let permissions = root.entry("permissions").or_insert_with(|| json!({}));
-        let Some(permissions) = permissions.as_object_mut() else { return Ok(Materialized::Skipped("Claude `permissions` is not an object".to_string())); };
+        let Some(permissions) = permissions.as_object_mut() else {
+            return Ok(Materialized::Skipped("Claude `permissions` is not an object".to_string()));
+        };
         let allow = permissions.entry("allow").or_insert_with(|| json!([]));
-        let Some(allow) = allow.as_array_mut() else { return Ok(Materialized::Skipped("Claude `permissions.allow` is not an array".to_string())); };
+        let Some(allow) = allow.as_array_mut() else {
+            return Ok(Materialized::Skipped("Claude `permissions.allow` is not an array".to_string()));
+        };
         for command in &self.claude_allowed_commands {
             if !allow.iter().any(|v| v.as_str() == Some(command)) {
                 allow.push(Value::String(command.clone()));
@@ -303,8 +438,10 @@ pub struct InstallReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostConfigFact {
+    /// `current` | `absent` | `drifted` | `unreadable` | `shadowed`.
     pub state: String,
     pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
@@ -313,15 +450,27 @@ pub struct HostReadinessReport {
     pub host: String,
     pub user_registration: HostConfigFact,
     pub repository_adapter: HostConfigFact,
+    /// `user` | `repository` | `both` | `none`.
     pub effective_source: String,
+    /// `reachable` | `unreachable` | `unchecked`.
+    pub connectivity: String,
     pub ready: bool,
     pub result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_action: Option<String>,
 }
 
-enum Materialized { Wrote, Skipped(String) }
+enum Materialized {
+    Wrote,
+    Skipped(String),
+}
 
 fn with_action<F>(path: &Path, materialize: F) -> Result<AdapterAction, String>
-where F: FnOnce() -> Result<Materialized, String> {
+where
+    F: FnOnce() -> Result<Materialized, String>,
+{
     let before = fs::read(path).ok();
     match materialize()? {
         Materialized::Skipped(reason) => Ok(AdapterAction::Skipped(reason)),
@@ -339,32 +488,58 @@ where F: FnOnce() -> Result<Materialized, String> {
 
 fn append_codex_server(table: &toml::Table, additions: &mut String, server: &HostServer) {
     if !toml_path_exists(table, &["mcp_servers", &server.name]) {
-        additions.push_str(&format!("[mcp_servers.{}]\ncommand = {:?}\nargs = [{}]\n\n", server.name, server.command, server.args.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", ")));
+        additions.push_str(&format!(
+            "[mcp_servers.{}]\ncommand = {:?}\nargs = [{}]\n\n",
+            server.name,
+            server.command,
+            server
+                .args
+                .iter()
+                .map(|arg| format!("{arg:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     for tool in &server.codex_approval_tools {
         if !toml_path_exists(table, &["mcp_servers", &server.name, "tools", tool]) {
-            additions.push_str(&format!("[mcp_servers.{}.tools.{}]\napproval_mode = \"approve\"\n\n", server.name, tool));
+            additions.push_str(&format!(
+                "[mcp_servers.{}.tools.{}]\napproval_mode = \"approve\"\n\n",
+                server.name, tool
+            ));
         }
     }
 }
 
 fn toml_path_exists(table: &toml::Table, path: &[&str]) -> bool {
-    let mut value = match table.get(path[0]) { Some(value) => value, None => return false };
+    let mut value = match table.get(path[0]) {
+        Some(value) => value,
+        None => return false,
+    };
     for key in &path[1..] {
-        value = match value.as_table().and_then(|t| t.get(*key)) { Some(value) => value, None => return false };
+        value = match value.as_table().and_then(|t| t.get(*key)) {
+            Some(value) => value,
+            None => return false,
+        };
     }
     value.as_table().is_some()
 }
 
-fn parse_toml_or_skip(existing: &str, label: &str) -> Result<toml::Table, String> {
-    if existing.trim().is_empty() { return Ok(toml::Table::new()); }
-    existing.parse::<toml::Table>().map_err(|_| format!("{label} is not parseable TOML"))
+fn parse_toml_materialized(existing: &str, label: &str) -> Result<toml::Table, Materialized> {
+    if existing.trim().is_empty() {
+        return Ok(toml::Table::new());
+    }
+    existing
+        .parse::<toml::Table>()
+        .map_err(|_| Materialized::Skipped(format!("{label} is not parseable TOML")))
 }
 
 fn codex_server_toml(server: &HostServer) -> toml::Value {
     let mut table = toml::Table::new();
     table.insert("command".to_string(), toml::Value::String(server.command.clone()));
-    table.insert("args".to_string(), toml::Value::Array(server.args.iter().cloned().map(toml::Value::String).collect()));
+    table.insert(
+        "args".to_string(),
+        toml::Value::Array(server.args.iter().cloned().map(toml::Value::String).collect()),
+    );
     if !server.codex_approval_tools.is_empty() {
         let mut tools = toml::Table::new();
         for tool in &server.codex_approval_tools {
@@ -378,69 +553,200 @@ fn codex_server_toml(server: &HostServer) -> toml::Value {
 }
 
 fn claude_server_json(server: &HostServer) -> Value {
-    json!({ "type": "stdio", "command": server.command.clone(), "args": server.args.clone(), "env": server.env.clone() })
+    json!({
+        "type": "stdio",
+        "command": server.command.clone(),
+        "args": server.args.clone(),
+        "env": server.env.clone()
+    })
 }
 
 fn codex_server_is_owned(value: &toml::Value, expected: &HostServer) -> bool {
-    let Some(table) = value.as_table() else { return false; };
-    let Some(command) = table.get("command").and_then(|v| v.as_str()) else { return false; };
-    let args_match = table.get("args").and_then(|v| v.as_array()).is_some_and(|args| args.iter().filter_map(|v| v.as_str()).eq(expected.args.iter().map(String::as_str)));
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    let Some(command) = table.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let args_match = table
+        .get("args")
+        .and_then(|v| v.as_array())
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(|v| v.as_str())
+                .eq(expected.args.iter().map(String::as_str))
+        });
     command_name_matches(command, &expected.command) && args_match
 }
 
 fn claude_server_is_owned(value: &Value, expected: &HostServer) -> bool {
     let command = value.get("command").and_then(|v| v.as_str());
-    let args_match = value.get("args").and_then(|v| v.as_array()).is_some_and(|args| args.iter().filter_map(|v| v.as_str()).eq(expected.args.iter().map(String::as_str)));
-    let stdio_or_absent = value.get("type").and_then(|v| v.as_str()).is_none_or(|t| t == "stdio");
-    command.is_some_and(|c| command_name_matches(c, &expected.command)) && args_match && stdio_or_absent
+    let args_match = value
+        .get("args")
+        .and_then(|v| v.as_array())
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(|v| v.as_str())
+                .eq(expected.args.iter().map(String::as_str))
+        });
+    let stdio_or_absent = match value.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t == "stdio",
+        None => true,
+    };
+    command.is_some_and(|c| command_name_matches(c, &expected.command))
+        && args_match
+        && stdio_or_absent
 }
 
 fn command_name_matches(actual: &str, expected: &str) -> bool {
-    actual == expected || Path::new(actual).file_name().and_then(|name| name.to_str()) == Path::new(expected).file_name().and_then(|name| name.to_str())
+    actual == expected
+        || Path::new(actual).file_name().and_then(|name| name.to_str())
+            == Path::new(expected).file_name().and_then(|name| name.to_str())
 }
 
 fn inspect_claude_config(path: &Path, expected: &[HostServer]) -> HostConfigFact {
-    let raw = match fs::read_to_string(path) { Ok(raw) => raw, Err(_) => return fact("absent", path, None) };
-    let doc: Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return fact("unreadable", path, Some("not parseable JSON".to_string())) };
-    let Some(servers) = doc.get("mcpServers").and_then(|v| v.as_object()) else { return fact("absent", path, Some("missing mcpServers".to_string())) };
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return fact("absent", path, None),
+    };
+    let doc: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return fact("unreadable", path, Some("not parseable JSON".to_string())),
+    };
+    let Some(servers) = doc.get("mcpServers").and_then(|v| v.as_object()) else {
+        return fact("absent", path, Some("missing mcpServers".to_string()));
+    };
     for server in expected {
         match servers.get(&server.name) {
             Some(value) if claude_server_is_owned(value, server) => {}
-            Some(_) => return fact("drifted", path, Some(format!("{} exists but is not owned/current", server.name))),
-            None => return fact("drifted", path, Some(format!("missing {} MCP server", server.name))),
+            Some(_) => {
+                return fact(
+                    "drifted",
+                    path,
+                    Some(format!("{} exists but is not owned/current", server.name)),
+                )
+            }
+            None => {
+                return fact(
+                    "drifted",
+                    path,
+                    Some(format!("missing {} MCP server", server.name)),
+                )
+            }
         }
     }
     fact("current", path, None)
 }
 
 fn inspect_codex_config(path: &Path, expected: &[HostServer]) -> HostConfigFact {
-    let raw = match fs::read_to_string(path) { Ok(raw) => raw, Err(_) => return fact("absent", path, None) };
-    let table: toml::Table = match raw.parse() { Ok(v) => v, Err(_) => return fact("unreadable", path, Some("not parseable TOML".to_string())) };
-    let Some(servers) = table.get("mcp_servers").and_then(|v| v.as_table()) else { return fact("absent", path, Some("missing mcp_servers".to_string())) };
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return fact("absent", path, None),
+    };
+    let table: toml::Table = match raw.parse() {
+        Ok(v) => v,
+        Err(_) => return fact("unreadable", path, Some("not parseable TOML".to_string())),
+    };
+    let Some(servers) = table.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return fact("absent", path, Some("missing mcp_servers".to_string()));
+    };
     for server in expected {
         match servers.get(&server.name) {
             Some(value) if codex_server_is_owned(value, server) => {}
-            Some(_) => return fact("drifted", path, Some(format!("{} exists but is not owned/current", server.name))),
-            None => return fact("drifted", path, Some(format!("missing {} MCP server", server.name))),
+            Some(_) => {
+                return fact(
+                    "drifted",
+                    path,
+                    Some(format!("{} exists but is not owned/current", server.name)),
+                )
+            }
+            None => {
+                return fact(
+                    "drifted",
+                    path,
+                    Some(format!("missing {} MCP server", server.name)),
+                )
+            }
         }
     }
     fact("current", path, None)
 }
 
-fn build_readiness(host: &str, user: HostConfigFact, repo: HostConfigFact) -> HostReadinessReport {
-    let user_current = user.state == "current";
-    let repo_current = repo.state == "current";
-    let (effective_source, ready, result) = match (user_current, repo_current) {
-        (true, true) => ("both", true, "ready_both"),
-        (true, false) => ("user", true, "ready_globally"),
-        (false, true) => ("repository", true, "ready_repository"),
-        (false, false) => ("none", false, "setup_required"),
+fn build_readiness(
+    host: &str,
+    user_registration: HostConfigFact,
+    repository_adapter: HostConfigFact,
+) -> HostReadinessReport {
+    let user_current = user_registration.state == "current";
+    let repo_current = repository_adapter.state == "current";
+    let repo_blocks_user = user_current
+        && matches!(
+            repository_adapter.state.as_str(),
+            "drifted" | "unreadable" | "shadowed"
+        );
+
+    let mut repository_adapter = repository_adapter;
+    let (effective_source, ready, result, primary_action, secondary_action) = if repo_blocks_user {
+        repository_adapter.state = "shadowed".to_string();
+        if repository_adapter.detail.is_none() {
+            repository_adapter.detail = Some(
+                "repository adapter overrides the current user/global registration".to_string(),
+            );
+        }
+        (
+            "repository",
+            false,
+            "repository_override_blocks_global",
+            Some("Repair repository setup".to_string()),
+            Some("Remove repository override or add shared repository setup".to_string()),
+        )
+    } else if user_current && repo_current {
+        (
+            "both",
+            true,
+            "ready_both",
+            None,
+            Some("Add shared repository setup".to_string()),
+        )
+    } else if user_current {
+        (
+            "user",
+            true,
+            "ready_globally",
+            None,
+            Some("Add shared repository setup".to_string()),
+        )
+    } else if repo_current {
+        ("repository", true, "ready_repository", None, None)
+    } else {
+        (
+            "none",
+            false,
+            "setup_required",
+            Some("Set up this repo for agents".to_string()),
+            Some("Register user-wide setup".to_string()),
+        )
     };
-    HostReadinessReport { host: host.to_string(), user_registration: user, repository_adapter: repo, effective_source: effective_source.to_string(), ready, result: result.to_string() }
+
+    HostReadinessReport {
+        host: host.to_string(),
+        user_registration,
+        repository_adapter,
+        effective_source: effective_source.to_string(),
+        connectivity: "unchecked".to_string(),
+        ready,
+        result: result.to_string(),
+        primary_action,
+        secondary_action,
+    }
 }
 
 fn fact(state: &str, path: &Path, detail: Option<String>) -> HostConfigFact {
-    HostConfigFact { state: state.to_string(), path: path.display().to_string(), detail }
+    HostConfigFact {
+        state: state.to_string(),
+        path: path.display().to_string(),
+        detail,
+    }
 }
 
 fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
@@ -448,10 +754,14 @@ fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
     let path = dir.join(".gitignore");
     let entry = "scheduled_tasks.lock";
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == entry) { return Ok(Materialized::Wrote); }
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(Materialized::Wrote);
+    }
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
     let mut text = existing;
-    if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
     text.push_str(entry);
     text.push('\n');
     fs::write(&path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
@@ -459,31 +769,51 @@ fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     let mut text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
     text.push('\n');
     fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn write_toml(path: &Path, table: &toml::Table) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     let mut text = toml::to_string_pretty(table).map_err(|e| e.to_string())?;
-    if !text.ends_with('\n') { text.push('\n'); }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
     fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-struct UserConfigPaths { home: PathBuf, codex_config: PathBuf, claude_json: PathBuf }
+struct UserConfigPaths {
+    home: PathBuf,
+    codex_config: PathBuf,
+    claude_json: PathBuf,
+}
 
 fn default_user_config_paths() -> UserConfigPaths {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("~"));
-    let codex_home = env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-    UserConfigPaths { codex_config: codex_home.join("config.toml"), claude_json: home.join(".claude.json"), home }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    UserConfigPaths {
+        codex_config: codex_home.join("config.toml"),
+        claude_json: home.join(".claude.json"),
+        home,
+    }
 }
 
 fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
-        if dir.join(".git").exists() { return Some(dir.to_path_buf()); }
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
         dir = dir.parent()?;
     }
 }
@@ -505,5 +835,22 @@ mod tests {
         assert!(dir.path().join(".mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
         assert!(dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn unparseable_repo_codex_config_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(dir.path().join(".codex/config.toml"), "not = [toml").unwrap();
+        let install = HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]));
+        let report = install.install_repo(dir.path()).unwrap();
+        let codex = report
+            .files
+            .iter()
+            .find(|(path, _)| path == ".codex/config.toml")
+            .unwrap();
+        assert!(matches!(codex.1, AdapterAction::Skipped(_)));
     }
 }

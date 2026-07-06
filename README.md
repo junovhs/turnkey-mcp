@@ -301,6 +301,41 @@ resident owner process
 
 That pattern came directly from Ishoo's MCP transport. The generic module keeps the endpoint, token, lock, fingerprint, and recovery pieces while leaving app-specific state startup to the app.
 
+In the host-spawned MCP process, configure the server with a sidecar:
+
+```rust
+use turnkey_mcp::{McpServer, ServerConfig, SidecarConfig};
+
+let sidecar = SidecarConfig::new("todo", ".", ".todo/cache")
+    .owner_args(["--path", ".", "mcp-owner"]);
+
+let server = McpServer::new(
+    ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
+        .sidecar(sidecar)
+        // .tool(...)
+);
+
+std::process::exit(server.run_stdio());
+```
+
+In the hidden owner process, build the same server **without** `.sidecar(...)` and pass `handle_line` to the owner runtime:
+
+```rust
+use turnkey_mcp::{sidecar, McpServer, ServerConfig, SidecarConfig};
+
+let sidecar_config = SidecarConfig::new("todo", ".", ".todo/cache")
+    .owner_args(["--path", ".", "mcp-owner"]);
+
+let owner_server = McpServer::new(
+    ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
+        // .tool(...)
+);
+
+sidecar::run_owner_server(sidecar_config, move |line| owner_server.handle_line(line))?;
+```
+
+That split is the key non-regression target for Ishoo: the stdio process is disposable host glue; the resident owner is the app/store authority.
+
 ## Project boundaries
 
 This package should stay small.

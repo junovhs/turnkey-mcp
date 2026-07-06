@@ -7,6 +7,9 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const SERVER_ERROR: i64 = -32000;
+/// Generic counterpart to Ishoo's STOR-22 `STORE_SERVICE_UNAVAILABLE` code.
+/// Returned when a mutating tool call cannot safely reach the resident owner.
+pub const OWNER_SERVICE_UNAVAILABLE: i64 = -32010;
 
 /// Context passed to every tool handler.
 #[derive(Clone, Debug)]
