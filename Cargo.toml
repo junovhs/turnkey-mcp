@@ -1,10 +1,10 @@
 [package]
-name = "turnkey-mcp"
+name = "mcp-product-infra"
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Turnkey MCP for apps: stdio protocol, typed tools, host setup, sidecar lifecycle, and manifest-friendly integration."
-repository = "https://github.com/junovhs/turnkey-mcp"
+repository = "https://github.com/junovhs/mcp-product-infra"
 readme = "README.md"
 keywords = ["mcp", "agents", "model-context-protocol", "sidecar"]
 categories = ["development-tools", "api-bindings"]

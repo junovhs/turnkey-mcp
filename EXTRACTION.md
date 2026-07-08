@@ -174,9 +174,9 @@ McpServer::new(ServerConfig::new("my-app", version, workspace))
 For non-Rust apps, the target is:
 
 ```bash
-turnkey-mcp serve --manifest ./mcp.manifest.json
-turnkey-mcp install --manifest ./mcp.manifest.json --user
-turnkey-mcp doctor --manifest ./mcp.manifest.json
+mcp-product-infra serve --manifest ./mcp.manifest.json
+mcp-product-infra install --manifest ./mcp.manifest.json --user
+mcp-product-infra doctor --manifest ./mcp.manifest.json
 ```
 
 That runner is not complete yet. The manifest types are included as the next seam.

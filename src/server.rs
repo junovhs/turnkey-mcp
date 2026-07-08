@@ -165,7 +165,7 @@ impl ServerConfig {
             serial: false,
             owner_prose: OwnerProse::default(),
             annotate_degraded_reads: None,
-            read_annotation_source: "turnkey_mcp_sidecar".to_string(),
+            read_annotation_source: "mcp_product_infra_sidecar".to_string(),
         }
     }
 
@@ -269,7 +269,7 @@ fn default_env_prefix(app_name: &str) -> String {
         })
         .collect();
     if folded.is_empty() {
-        "TURNKEY".to_string()
+        "MCP_PRODUCT_INFRA".to_string()
     } else {
         folded
     }

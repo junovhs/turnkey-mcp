@@ -1,6 +1,6 @@
 # Notes
 
-This package is being driven toward one specific goal: Ishoo should be able to depend on `turnkey-mcp` and remove its local MCP runtime without losing robustness.
+This package is being driven toward one specific goal: Ishoo should be able to depend on `mcp-product-infra` and remove its local MCP runtime without losing robustness.
 
 The source of truth for robustness is the copied Ishoo code in `origin/ishoo/`.
 
@@ -23,10 +23,10 @@ This pass restores the most important behavior that must not regress:
 
 When this repo compiles and tests pass, the next local coding agent should be able to do this in Ishoo:
 
-1. Add `turnkey-mcp` as a dependency.
-2. Replace Ishoo's stdio MCP loop with `turnkey_mcp::McpServer`.
-3. Replace Ishoo's resident owner transport with `turnkey_mcp::sidecar`.
-4. Replace Ishoo's host adapter materialization with `turnkey_mcp::HostInstall`.
+1. Add `mcp-product-infra` as a dependency.
+2. Replace Ishoo's stdio MCP loop with `mcp_product_infra::McpServer`.
+3. Replace Ishoo's resident owner transport with `mcp_product_infra::sidecar`.
+4. Replace Ishoo's host adapter materialization with `mcp_product_infra::HostInstall`.
 5. Keep Ishoo's actual tool handlers, instructions, store sync hooks, status annotations, and product semantics inside Ishoo.
 6. Delete the local duplicated MCP runtime only after parity tests pass.
 

@@ -16,8 +16,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MANAGED_BEGIN: &str = "<!-- turnkey-mcp:begin -->";
-const MANAGED_END: &str = "<!-- turnkey-mcp:end -->";
+const MANAGED_BEGIN: &str = "<!-- mcp-product-infra:begin -->";
+const MANAGED_END: &str = "<!-- mcp-product-infra:end -->";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostServer {

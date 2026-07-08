@@ -1,5 +1,5 @@
+use mcp_product_infra::{McpServer, ServerConfig, ToolError, ToolSpec};
 use serde_json::json;
-use turnkey_mcp::{McpServer, ServerConfig, ToolError, ToolSpec};
 
 fn main() {
     let server = McpServer::new(

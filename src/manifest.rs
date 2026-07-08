@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Language-agnostic app description for the future `turnkey-mcp serve --manifest` path.
+/// Language-agnostic app description for the future `mcp-product-infra serve --manifest` path.
 ///
 /// The manifest mode is intentionally simple: Rust owns MCP framing and lifecycle;
 /// the app-owned handler process owns behavior.
@@ -47,7 +47,7 @@ pub enum ManifestMutation {
     Dynamic,
 }
 
-/// Wire request sent from the turnkey-mcp sidecar to a language-specific handler.
+/// Wire request sent from the mcp-product-infra sidecar to a language-specific handler.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HandlerRequest {
     pub tool: String,

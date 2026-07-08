@@ -224,5 +224,5 @@ fn capture_inner<F>(_f: F) -> Result<(String, Result<(), String>), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
-    Err("turnkey-mcp stdout capture is not supported on this platform".to_string())
+    Err("mcp-product-infra stdout capture is not supported on this platform".to_string())
 }

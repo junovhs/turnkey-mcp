@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.3.0 - engineering mined from semmap's MCP
+## 0.3.0 - engineering mined from semmap's MCP; renamed to mcp-product-infra
+
+- Crate and repo renamed from `turnkey-mcp` to `mcp-product-infra` (unpublished,
+  so no compatibility shim; historical entries below use the new name).
 
 Capabilities semmap's hand-rolled MCP server had that the crate lacked, now
 generalized here (semmap provenance: `src/mcp/{mod,capture,resources,registry}.rs`):

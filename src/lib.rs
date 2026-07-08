@@ -1,4 +1,4 @@
-//! turnkey-mcp is a small toolkit for apps that want to expose themselves to
+//! mcp-product-infra is a small toolkit for apps that want to expose themselves to
 //! agents through MCP.
 //!
 //! It is intentionally not an agent framework and not a generic MCP manager. It

@@ -1,8 +1,8 @@
-# turnkey-mcp
+# mcp-product-infra
 
 Turnkey MCP for apps.
 
-`turnkey-mcp` is a small, boring toolkit for developers who want their app to be operated by agents through MCP without rebuilding setup, lifecycle, config, and recovery glue every time.
+`mcp-product-infra` is a small, boring toolkit for developers who want their app to be operated by agents through MCP without rebuilding setup, lifecycle, config, and recovery glue every time.
 
 It is **Rust-native**, because the first extraction comes from Ishoo's Rust MCP runtime. It is not intended to be **Rust-only**. The target shape is:
 
@@ -11,7 +11,7 @@ Rust apps
   import the crate directly
 
 Non-Rust apps
-  run a small turnkey-mcp sidecar or app-owned helper binary
+  run a small mcp-product-infra sidecar or app-owned helper binary
   and connect handlers through a manifest / local process boundary
 ```
 
@@ -19,7 +19,7 @@ This is not an agent framework, marketplace, generic MCP manager, desktop app, o
 
 ## Status
 
-**Ishoo runs on this crate.** The extraction is complete for the server + sidecar layers: Ishoo's MCP runtime (`src/mcp/`) is now a thin product composition over `turnkey-mcp`, and Ishoo's full pre-extraction MCP behavior suite (126 tests: handshake, dispatch ordering, owner recovery, fail-closed writes) passes unchanged against it. The repo keeps the originally copied Ishoo source under `origin/ishoo/` so the extraction stays auditable.
+**Ishoo runs on this crate.** The extraction is complete for the server + sidecar layers: Ishoo's MCP runtime (`src/mcp/`) is now a thin product composition over `mcp-product-infra`, and Ishoo's full pre-extraction MCP behavior suite (126 tests: handshake, dispatch ordering, owner recovery, fail-closed writes) passes unchanged against it. The repo keeps the originally copied Ishoo source under `origin/ishoo/` so the extraction stays auditable.
 
 Hard-won behaviors carried over from production incidents, at parity with current Ishoo:
 
@@ -68,7 +68,7 @@ The first tool handler is usually easy. The annoying parts are:
 - how does a tool result tell the agent what actually happened?
 - how do you repair setup without hand-editing JSON/TOML?
 
-`turnkey-mcp` packages those boring hard parts.
+`mcp-product-infra` packages those boring hard parts.
 
 ## Provenance
 
@@ -101,7 +101,7 @@ For local development:
 
 ```toml
 [dependencies]
-turnkey-mcp = { path = "../turnkey-mcp" }
+mcp-product-infra = { path = "../mcp-product-infra" }
 serde_json = "1"
 ```
 
@@ -109,7 +109,7 @@ When published:
 
 ```toml
 [dependencies]
-turnkey-mcp = "0.1"
+mcp-product-infra = "0.1"
 serde_json = "1"
 ```
 
@@ -117,7 +117,7 @@ serde_json = "1"
 
 ```rust
 use serde_json::json;
-use turnkey_mcp::{McpServer, ServerConfig, ToolError, ToolSpec};
+use mcp_product_infra::{McpServer, ServerConfig, ToolError, ToolSpec};
 
 fn main() {
     let server = McpServer::new(
@@ -179,13 +179,13 @@ The project should support two integration modes:
 
 ### Mode 1: app-owned helper binary
 
-Any app can ship a small MCP helper binary built with `turnkey-mcp`:
+Any app can ship a small MCP helper binary built with `mcp-product-infra`:
 
 ```text
 Electron / Python / Go / Swift app
         owns app behavior
         invokes or talks to
-small Rust MCP helper built with turnkey-mcp
+small Rust MCP helper built with mcp-product-infra
         exposes MCP to
 Claude Code / Codex / Cursor / other hosts
 ```
@@ -197,7 +197,7 @@ This is often the cleanest production shape: your app remains written in its own
 The intended language-agnostic next step is a manifest mode:
 
 ```bash
-turnkey-mcp serve --manifest ./mcp.manifest.json
+mcp-product-infra serve --manifest ./mcp.manifest.json
 ```
 
 Example manifest:
@@ -294,7 +294,7 @@ Serve app artifacts as MCP resources (a **closed set** — `resources/read` only
 serves a URI the provider enumerated, never an arbitrary path):
 
 ```rust
-use turnkey_mcp::{ResourceContent, ResourceEntry};
+use mcp_product_infra::{ResourceContent, ResourceEntry};
 
 let config = config.resources(|ctx| {
     let map = ctx.workspace_root.join("MAP.md");
@@ -323,7 +323,7 @@ let config = config.before_tool(|ctx, name, _args| {
         return Ok(()); // the tool that produces the index is exempt
     }
     refresh_index(&ctx.workspace_root)
-        .map_err(|e| turnkey_mcp::ToolError::server(format!("auto-refresh failed: {e}")))
+        .map_err(|e| mcp_product_infra::ToolError::server(format!("auto-refresh failed: {e}")))
 });
 ```
 
@@ -349,7 +349,7 @@ pipe (and the capture's text inside your JSON-RPC stream).
 `HostInstall` provides no-clobber config writers for app-owned MCP servers:
 
 ```rust
-use turnkey_mcp::{HostInstall, HostServer};
+use mcp_product_infra::{HostInstall, HostServer};
 
 let install = HostInstall::new("todo")
     .server(HostServer::stdio("todo", "/usr/local/bin/todo", ["mcp"]));
@@ -376,7 +376,7 @@ That pattern came directly from Ishoo's MCP transport. The generic module keeps 
 In the host-spawned MCP process, configure the server with a sidecar:
 
 ```rust
-use turnkey_mcp::{McpServer, ServerConfig, SidecarConfig};
+use mcp_product_infra::{McpServer, ServerConfig, SidecarConfig};
 
 let sidecar = SidecarConfig::new("todo", ".", ".todo/cache")
     .owner_args(["--path", ".", "mcp-owner"]);
@@ -393,7 +393,7 @@ std::process::exit(server.run_stdio());
 In the hidden owner process, build the same server **without** `.sidecar(...)`, run your state startup in the `init` hook (it executes after the singleton lock is won and before the socket exists, so a doomed second owner never runs rival startup work), and pass `handle_line` to the owner runtime:
 
 ```rust
-use turnkey_mcp::{sidecar, McpServer, ServerConfig, SidecarConfig};
+use mcp_product_infra::{sidecar, McpServer, ServerConfig, SidecarConfig};
 
 let sidecar_config = SidecarConfig::new("todo", ".", ".todo/cache")
     .app_version(env!("CARGO_PKG_VERSION"))
@@ -428,7 +428,7 @@ That split is the key non-regression target for Ishoo: the stdio process is disp
 Agents should see your app's vocabulary, not this library's. `ServerConfig` exposes the product seams:
 
 ```rust
-use turnkey_mcp::OwnerProse;
+use mcp_product_infra::OwnerProse;
 
 ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
     // The fail-closed owner-unavailable errors, in your words:
@@ -456,7 +456,7 @@ ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
 
 ## Testing your integration
 
-`turnkey_mcp::sidecar::test_support` gives your suite the owner-recovery shapes without child processes: `unreachable_endpoint` (a registration whose socket refuses), `write_endpoint` (persist a registration), and `start_owner_thread` (a scripted in-process owner). The `Dispatch`/`ServerEvent` runtime internals are exposed `#[doc(hidden)]` for apps porting an existing MCP regression suite.
+`mcp_product_infra::sidecar::test_support` gives your suite the owner-recovery shapes without child processes: `unreachable_endpoint` (a registration whose socket refuses), `write_endpoint` (persist a registration), and `start_owner_thread` (a scripted in-process owner). The `Dispatch`/`ServerEvent` runtime internals are exposed `#[doc(hidden)]` for apps porting an existing MCP regression suite.
 
 ## Project boundaries
 
