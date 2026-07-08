@@ -19,7 +19,16 @@ This is not an agent framework, marketplace, generic MCP manager, desktop app, o
 
 ## Status
 
-This is an initial extraction package, not a polished release. The repo intentionally includes the copied Ishoo source under `origin/ishoo/` so the extraction is auditable and can continue in the normal developer way: copy working code first, then delete/generalize what is app-specific.
+**Ishoo runs on this crate.** The extraction is complete for the server + sidecar layers: Ishoo's MCP runtime (`src/mcp/`) is now a thin product composition over `turnkey-mcp`, and Ishoo's full pre-extraction MCP behavior suite (126 tests: handshake, dispatch ordering, owner recovery, fail-closed writes) passes unchanged against it. The repo keeps the originally copied Ishoo source under `origin/ishoo/` so the extraction stays auditable.
+
+Hard-won behaviors carried over from production incidents, at parity with current Ishoo:
+
+- bounded owner lifetime: a detached resident owner idle-reaps instead of lingering forever holding the installed binary locked
+- graceful upgrade handoff: a rebuilt/reinstalled app retires the stale-build owner via its build fingerprint (app version + binary signature)
+- post-reinstall executable resolution: a `current_exe()` that reads `… (deleted)` after an in-place reinstall still resolves to the replacement binary
+- zombie-aware liveness on Unix: an exited-but-unreaped owner reads as dead, so recovery re-elects instead of wedging writes forever (and spawned owners are reaped, so the zombie never forms)
+- exit-code-aware liveness on Windows: an `OpenProcess` handle to a terminated pid is not proof of life
+- fail-closed writes: a live-but-unreachable owner refuses mutations rather than ever spawning a rival writer
 
 ## What it gives you
 
@@ -318,12 +327,13 @@ let server = McpServer::new(
 std::process::exit(server.run_stdio());
 ```
 
-In the hidden owner process, build the same server **without** `.sidecar(...)` and pass `handle_line` to the owner runtime:
+In the hidden owner process, build the same server **without** `.sidecar(...)`, run your state startup in the `init` hook (it executes after the singleton lock is won and before the socket exists, so a doomed second owner never runs rival startup work), and pass `handle_line` to the owner runtime:
 
 ```rust
 use turnkey_mcp::{sidecar, McpServer, ServerConfig, SidecarConfig};
 
 let sidecar_config = SidecarConfig::new("todo", ".", ".todo/cache")
+    .app_version(env!("CARGO_PKG_VERSION"))
     .owner_args(["--path", ".", "mcp-owner"]);
 
 let owner_server = McpServer::new(
@@ -331,10 +341,59 @@ let owner_server = McpServer::new(
         // .tool(...)
 );
 
-sidecar::run_owner_server(sidecar_config, move |line| owner_server.handle_line(line))?;
+sidecar::run_owner_server(
+    sidecar_config,
+    || {
+        // App state startup: sync, background workers, open the store…
+        Ok(())
+    },
+    move |line| owner_server.handle_line(line),
+)?;
 ```
 
 That split is the key non-regression target for Ishoo: the stdio process is disposable host glue; the resident owner is the app/store authority.
+
+`SidecarConfig` carries the lifecycle knobs:
+
+- `.app_version(...)` — folded into the owner build fingerprint so an app release retires stale owners
+- `.idle_timeout(...)` / `.idle_timeout_env("MYAPP_OWNER_IDLE_TIMEOUT_MS")` — the bounded owner lifetime (default 10 minutes without a client request)
+- `.liveness_path(...)` — the owner exits when this path disappears (e.g. your state dir), so an owner for a deleted workspace never lingers
+- `.drain(|| …)` — runs before any owner exit (idle-reap or shutdown handoff) so in-flight serialized work finishes first
+
+## Speaking your app's language
+
+Agents should see your app's vocabulary, not this library's. `ServerConfig` exposes the product seams:
+
+```rust
+use turnkey_mcp::OwnerProse;
+
+ServerConfig::new("todo", env!("CARGO_PKG_VERSION"), ".")
+    // The fail-closed owner-unavailable errors, in your words:
+    .owner_prose(OwnerProse {
+        code: -32010,
+        prefix: "todo service unavailable — write refused; no changes were made.".into(),
+        owner_noun: "resident todo owner".into(),
+        restart_hint: "Restart Todo (or run `todo mcp-owner`)".into(),
+    })
+    // Env prefix for {PREFIX}_MCP_SHUTDOWN_DRAIN_MS / {PREFIX}_MCP_PARENT_WATCHDOG_MS:
+    .env_prefix("TODO")
+    // Annotate only your status tool when a read degrades past an unreachable
+    // owner (default: every degraded read is annotated):
+    .annotate_degraded_reads(["todo_status"])
+    .read_annotation_source("todo_transport")
+    // Tolerate a failed owner election when your app has no state yet (the
+    // "opened in a brand-new repo" case) instead of exiting:
+    .sidecar_optional()
+    // Attach durability facts to every successful mutation result:
+    .mutation_hook(|_ctx, _tool, value| {
+        // e.g. snapshot app state, then fold the outcome into `value`
+        Ok(())
+    });
+```
+
+## Testing your integration
+
+`turnkey_mcp::sidecar::test_support` gives your suite the owner-recovery shapes without child processes: `unreachable_endpoint` (a registration whose socket refuses), `write_endpoint` (persist a registration), and `start_owner_thread` (a scripted in-process owner). The `Dispatch`/`ServerEvent` runtime internals are exposed `#[doc(hidden)]` for apps porting an existing MCP regression suite.
 
 ## Project boundaries
 

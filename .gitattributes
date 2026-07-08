@@ -1,2 +1,7 @@
 *.ishoo binary
 .ishoo/** binary
+
+# Normalize to LF in the repo and working tree (Rust toolchain expectation).
+* text=auto eol=lf
+*.png binary
+*.jpg binary

@@ -38,18 +38,13 @@ pub struct ManifestTool {
     pub mutation: ManifestMutation,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestMutation {
+    #[default]
     Never,
     Always,
     Dynamic,
-}
-
-impl Default for ManifestMutation {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 /// Wire request sent from the turnkey-mcp sidecar to a language-specific handler.

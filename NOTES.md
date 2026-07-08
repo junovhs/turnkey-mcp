@@ -32,6 +32,8 @@ When this repo compiles and tests pass, the next local coding agent should be ab
 
 ## Non-regression checklist
 
+Status 2026-07-07: **complete** — Ishoo's local MCP runtime (`src/mcp/transport.rs`, the runtime half of `src/mcp/mod.rs`) was removed in Ishoo MCP-62; every item below is covered by Ishoo's unchanged 126-test MCP suite passing against this crate plus this repo's own 22 tests, and a live `ishoo mcp` smoke (initialize/tools list/read/mutation through a real resident owner).
+
 Before removing Ishoo's local MCP code, verify all of these still hold:
 
 - initialize echoes protocol version and returns server instructions

@@ -2,6 +2,8 @@
 
 This project is extracted from Ishoo's MCP implementation.
 
+Status 2026-07-07: the server + sidecar extraction is **complete and consumed** — Ishoo depends on this crate and deleted its local MCP runtime (Ishoo issue MCP-62). The sidecar was additionally hardened to Ishoo's current transport (bounded owner lifetime/idle-reap, fingerprint upgrade handoff, post-reinstall exe resolution, zombie-aware liveness + child reaping, Windows exit-code liveness, drain hooks, init hook, test_support). The host-adapters layer (`src/adapters/`) is extracted but not yet consumed by Ishoo — that migration is tracked in Ishoo.
+
 The extraction philosophy is **copy first, delete second**:
 
 1. copy working Ishoo MCP/runtime code
