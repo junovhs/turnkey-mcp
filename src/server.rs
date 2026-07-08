@@ -121,6 +121,13 @@ pub struct ServerConfig {
     /// yet). Keep true (the default) when app state exists, because writes
     /// require the resident single owner.
     pub sidecar_required: bool,
+    /// Strictly serial transport: handle each request to completion (response
+    /// written) before consuming the next, with no dispatch threads. Required
+    /// when tool handlers redirect process-global state — most notably
+    /// [`crate::capture::capture_stdout`], whose stdout-fd redirect a
+    /// concurrent response write would corrupt. Off by default (reads run
+    /// concurrently, mutations FIFO).
+    pub serial: bool,
     /// The vocabulary of the fail-closed owner-unavailable errors.
     pub owner_prose: OwnerProse,
     /// Which read tools get the `mcp_owner: unreachable` annotation when a read
@@ -155,6 +162,7 @@ impl ServerConfig {
             resources: None,
             sidecar: None,
             sidecar_required: true,
+            serial: false,
             owner_prose: OwnerProse::default(),
             annotate_degraded_reads: None,
             read_annotation_source: "turnkey_mcp_sidecar".to_string(),
@@ -207,6 +215,12 @@ impl ServerConfig {
     /// zero-regression extraction of Ishoo's `mcp` -> `mcp-owner` split.
     pub fn sidecar(mut self, config: SidecarConfig) -> Self {
         self.sidecar = Some(config);
+        self
+    }
+
+    /// Run the transport strictly serially. See the `serial` field.
+    pub fn serial(mut self) -> Self {
+        self.serial = true;
         self
     }
 
@@ -301,9 +315,31 @@ impl McpServer {
         spawn_stdin_reader(events_tx.clone());
         spawn_parent_watchdog(&self.config.env_prefix, events_tx.clone());
 
-        let dispatch = Dispatch::new(self.clone(), events_tx, owner);
         let stdout = io::stdout();
         let mut out = stdout.lock();
+        self.run_event_loop(events_tx, events_rx, owner, &mut out)
+    }
+
+    /// The transport event loop behind `run_stdio`, driven by injected event
+    /// channels and an injected writer so tests can observe real ordering.
+    fn run_event_loop(
+        &self,
+        events_tx: mpsc::Sender<ServerEvent>,
+        events_rx: mpsc::Receiver<ServerEvent>,
+        owner: Option<OwnerEndpoint>,
+        out: &mut impl Write,
+    ) -> i32 {
+        // Serial mode: no dispatch threads exist at all — each request is
+        // handled to completion (response written) on this thread before the
+        // next event is consumed. Required for stdout-capture handlers (see
+        // `capture`): the fd redirect is process-global, so a response write
+        // must never overlap a running handler.
+        let dispatch = if self.config.serial {
+            drop(events_tx);
+            None
+        } else {
+            Some(Dispatch::new(self.clone(), events_tx, owner.clone()))
+        };
         let mut active_requests = 0usize;
         let mut input_closed = false;
         let mut shutdown_deadline: Option<Instant> = None;
@@ -333,8 +369,21 @@ impl McpServer {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    active_requests += 1;
-                    dispatch.dispatch(line);
+                    match &dispatch {
+                        Some(dispatch) => {
+                            active_requests += 1;
+                            dispatch.dispatch(line);
+                        }
+                        None => {
+                            if let Some(response) =
+                                handle_line_contained(self, &line, owner.as_ref())
+                            {
+                                if writeln!(out, "{response}").is_err() || out.flush().is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 ServerEvent::InputClosed => {
                     input_closed = true;
@@ -1046,6 +1095,59 @@ mod tests {
             assert_eq!(by_id[&9]["error"]["code"], INTERNAL_ERROR);
             assert_eq!(by_id[&10]["result"]["structuredContent"]["created"], true);
         });
+    }
+
+    #[test]
+    fn serial_mode_answers_in_submission_order_and_exits_on_input_close() {
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", ".")
+                .serial()
+                .tool(ToolSpec::read(
+                    "todo_status",
+                    "Return status",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "ok": true })),
+                ))
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                )),
+        );
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let feeder = events_tx.clone();
+        feeder
+            .send(ServerEvent::Line(call_frame(1, "todo_status")))
+            .unwrap();
+        feeder
+            .send(ServerEvent::Line(call_frame(2, "todo_create")))
+            .unwrap();
+        feeder
+            .send(ServerEvent::Line(call_frame(3, "todo_status")))
+            .unwrap();
+        feeder.send(ServerEvent::InputClosed).unwrap();
+        drop(feeder);
+
+        let mut out = Vec::new();
+        let code = server.run_event_loop(events_tx, events_rx, None, &mut out);
+        assert_eq!(code, 0, "loop exits cleanly on input close");
+
+        let ids: Vec<i64> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "serial mode answers reads and mutations strictly in submission order"
+        );
     }
 
     #[test]

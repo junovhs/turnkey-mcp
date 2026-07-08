@@ -42,6 +42,8 @@ Hard-won behaviors carried over from production incidents, at parity with curren
 - panic containment: a panicking handler answers with a JSON-RPC internal error instead of hanging the request or killing the mutation worker
 - `before_tool` pre-dispatch hook (per-call readiness/freshness gates that can short-circuit a call)
 - in-process stdout capture (`capture::capture_stdout`) so print-first CLI core fns can serve as tool handlers without a rewrite
+- plain-text tool results (a `Value::String` result is served as raw text, no `structuredContent`)
+- `ServerConfig::serial()` for apps whose handlers must never overlap a response write (the capture case)
 - optional resident sidecar owner for app state that needs a single writer
 - crash-safe owner election through a lock file
 - stale owner retirement after rebuilds/reinstalls
@@ -335,6 +337,12 @@ panic-safe restore. Calls are serialized by an internal global lock. This is
 how a CLI's exact output becomes a tool's text content without rewriting every
 command. Caveat: the redirect cannot be observed under `cargo test`'s output
 capture — test it by spawning your real binary.
+
+Capture-based handlers need two config choices: return the captured text as
+`Value::String` (served as a raw text block, no `structuredContent`), and run
+the transport with `ServerConfig::serial()` — the fd redirect is process-global,
+so a concurrent response write on the main loop would land inside the capture
+pipe (and the capture's text inside your JSON-RPC stream).
 
 ## Host setup
 

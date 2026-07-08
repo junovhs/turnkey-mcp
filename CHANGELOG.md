@@ -25,6 +25,14 @@ generalized here (semmap provenance: `src/mcp/{mod,capture,resources,registry}.r
   cwd handling, drain thread, and panic-safe fd restore, so print-first CLI
   core fns can serve as tool handlers.
 - `types::INTERNAL_ERROR` (-32603) exported alongside the other JSON-RPC codes.
+- Plain-text tool results: a handler returning `Value::String` becomes the raw
+  text content block with no `structuredContent` (which the spec types as an
+  object), so captured CLI output round-trips unquoted. Object results are
+  unchanged.
+- `ServerConfig::serial()`: strictly serial transport — each request is handled
+  to completion (response written) before the next is consumed, no dispatch
+  threads. Required for stdout-capture handlers, whose process-global fd
+  redirect a concurrent response write would corrupt.
 
 
 ## 0.2.0 - parity with current Ishoo; Ishoo consumes the crate
