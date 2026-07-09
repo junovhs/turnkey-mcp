@@ -94,6 +94,17 @@ impl OwnerProse {
             self.prefix, self.owner_noun, self.restart_hint
         )
     }
+
+    /// FIX-169: request was delivered; the mutation may already be committed.
+    /// Must not claim "write refused" and must not invite a blind retry.
+    fn ambiguous_commit(&self, error: &str) -> String {
+        format!(
+            "write may have committed; verify before retrying. The {} accepted the request \
+             but the response was not received ({error}). Confirm with a read before any \
+             retry; reuse mutation_id when retrying creates. {}.",
+            self.owner_noun, self.restart_hint
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -482,22 +493,40 @@ impl McpServer {
         let prose = &self.config.owner_prose;
         match sidecar::send_line(owner, line) {
             Ok(response) => response,
-            // The resident owner is unreachable. A mutation must NEVER fall back to
-            // an in-process write while a *live* owner exists (the second-writer
-            // hole). But a *dead* owner must not wedge every write forever, and we
-            // must never claim a recovery that did not happen. So re-elect: only
-            // when the owner is truly gone is the stale registration cleared and a
-            // fresh resident writer spawned, then the write is retried once. If
-            // re-election or the retry fails, refuse with an honest, actionable
-            // remedy — never a false "restarts automatically".
+            // FIX-169: the request left the client; the owner may already have
+            // committed. Do NOT recover/re-send (that double-applies), and do NOT
+            // claim "write refused". Tell the agent to verify before retrying.
+            Err(error)
+                if self.line_calls_mutating_tool(line) && error.may_have_committed() =>
+            {
+                Some(error_frame(
+                    request_id(line),
+                    prose.code,
+                    &prose.ambiguous_commit(error.message()),
+                ))
+            }
+            // The resident owner is unreachable before delivery. A mutation must
+            // NEVER fall back to an in-process write while a *live* owner exists
+            // (the second-writer hole). But a *dead* owner must not wedge every
+            // write forever, and we must never claim a recovery that did not
+            // happen. So re-elect: only when the owner is truly gone is the stale
+            // registration cleared and a fresh resident writer spawned, then the
+            // write is retried once. If re-election or the retry fails, refuse
+            // with an honest, actionable remedy — never a false "restarts
+            // automatically".
             Err(_) if self.line_calls_mutating_tool(line) => {
                 match sidecar::recover_owner(sidecar_config, owner) {
                     OwnerRecovery::Reelected(fresh) => match sidecar::send_line(&fresh, line) {
                         Ok(response) => response,
+                        Err(error) if error.may_have_committed() => Some(error_frame(
+                            request_id(line),
+                            prose.code,
+                            &prose.ambiguous_commit(error.message()),
+                        )),
                         Err(error) => Some(error_frame(
                             request_id(line),
                             prose.code,
-                            &prose.reelected_unreachable(&error),
+                            &prose.reelected_unreachable(error.message()),
                         )),
                     },
                     OwnerRecovery::LiveButUnreachable => Some(error_frame(
@@ -524,7 +553,7 @@ impl McpServer {
                 if annotate {
                     annotate_read_owner_unreachable(
                         self.handle_line(line),
-                        &error,
+                        error.message(),
                         &self.config.read_annotation_source,
                     )
                 } else {
@@ -1361,5 +1390,71 @@ mod tests {
         assert!(!parent_disappeared(42, 42));
         assert!(parent_disappeared(42, 43));
         assert!(parent_disappeared(42, 1));
+    }
+
+    /// FIX-169: after the owner applies a mutation, a lost response must not be
+    /// reported as "write refused" and must not re-send the mutation.
+    #[test]
+    fn mutation_response_lost_reports_verify_first_and_does_not_double_apply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let applied = Arc::new(AtomicUsize::new(0));
+        let applied_h = applied.clone();
+        let sidecar = SidecarConfig::new("todo", dir.path(), dir.path().join("cache"))
+            .app_version("0.1.0");
+        let owner = crate::sidecar::test_support::start_owner_thread_drop_response(
+            sidecar.clone(),
+            move |_line| {
+                applied_h.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    r#"{"jsonrpc":"2.0","id":42,"result":{"structuredContent":{"created":true}}}"#
+                        .to_string(),
+                )
+            },
+        )
+        .expect("drop-response owner");
+        crate::sidecar::test_support::write_endpoint(&sidecar, &owner);
+
+        let server = McpServer::new(
+            ServerConfig::new("todo", "0.1.0", dir.path())
+                .sidecar(sidecar)
+                .tool(ToolSpec::write(
+                    "todo_create",
+                    "Create",
+                    json!({ "type": "object", "properties": {} }),
+                    |_ctx, _args| Ok(json!({ "created": true })),
+                )),
+        );
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": { "name": "todo_create", "arguments": {} }
+        })
+        .to_string();
+
+        let raw = server
+            .handle_line_with_owner(&request, Some(&owner))
+            .expect("must produce a response frame");
+        let response: Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["error"]["code"], OWNER_SERVICE_UNAVAILABLE);
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("write may have committed"),
+            "must be verify-first, not write-refused: {message}"
+        );
+        assert!(
+            !message.contains("write refused") && !message.contains("no changes were made"),
+            "must not claim the write was refused: {message}"
+        );
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            1,
+            "owner must apply exactly once — no recover/re-send on ResponseLost"
+        );
     }
 }

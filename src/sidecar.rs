@@ -368,34 +368,94 @@ fn idle_poll_interval(idle_timeout: Duration) -> Duration {
     (idle_timeout / 20).clamp(Duration::from_millis(50), Duration::from_secs(1))
 }
 
-pub fn send_line(endpoint: &OwnerEndpoint, line: &str) -> Result<Option<String>, String> {
+/// Classified owner-socket failure (FIX-169).
+///
+/// A mutation that was fully flushed to the owner may already be committed when
+/// the response channel dies (Windows 10054/10060, mid-read reset, etc.). Those
+/// failures must not be treated as "write refused" and must not re-send the
+/// mutation — that is the duplicate-record / double-land path.
+#[derive(Debug, Clone)]
+pub enum OwnerTransportError {
+    /// Connect failed before any request bytes left the client.
+    Connect(String),
+    /// Request may not have been fully delivered to the owner.
+    Write(String),
+    /// Request was flushed; the owner may have applied the mutation.
+    ResponseLost(String),
+    /// Response bytes arrived but could not be parsed.
+    MalformedResponse(String),
+}
+
+impl OwnerTransportError {
+    /// True when the request left the client and a committed write is possible.
+    pub fn may_have_committed(&self) -> bool {
+        matches!(
+            self,
+            Self::ResponseLost(_) | Self::MalformedResponse(_)
+        )
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Connect(m)
+            | Self::Write(m)
+            | Self::ResponseLost(m)
+            | Self::MalformedResponse(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for OwnerTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for OwnerTransportError {}
+
+pub fn send_line(
+    endpoint: &OwnerEndpoint,
+    line: &str,
+) -> Result<Option<String>, OwnerTransportError> {
     let mut stream = TcpStream::connect_timeout(&endpoint.addr, Duration::from_secs(1))
-        .map_err(|e| format!("failed to connect to resident MCP owner: {e}"))?;
+        .map_err(|e| {
+            OwnerTransportError::Connect(format!("failed to connect to resident MCP owner: {e}"))
+        })?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|e| format!("failed to set MCP owner read timeout: {e}"))?;
+        .map_err(|e| {
+            OwnerTransportError::Write(format!("failed to set MCP owner read timeout: {e}"))
+        })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("failed to set MCP owner write timeout: {e}"))?;
+        .map_err(|e| {
+            OwnerTransportError::Write(format!("failed to set MCP owner write timeout: {e}"))
+        })?;
     let request = OwnerRequest {
         token: endpoint.token.clone(),
         line: line.to_string(),
     };
-    serde_json::to_writer(&mut stream, &request)
-        .map_err(|e| format!("failed to encode MCP owner request: {e}"))?;
+    serde_json::to_writer(&mut stream, &request).map_err(|e| {
+        OwnerTransportError::Write(format!("failed to encode MCP owner request: {e}"))
+    })?;
     stream
         .write_all(b"\n")
-        .map_err(|e| format!("failed to write MCP owner request: {e}"))?;
-    stream
-        .flush()
-        .map_err(|e| format!("failed to flush MCP owner request: {e}"))?;
+        .map_err(|e| {
+            OwnerTransportError::Write(format!("failed to write MCP owner request: {e}"))
+        })?;
+    stream.flush().map_err(|e| {
+        OwnerTransportError::Write(format!("failed to flush MCP owner request: {e}"))
+    })?;
 
+    // From here the owner may already be applying the mutation. A lost reply is
+    // ambiguous — never re-send the same mutation as if the write were refused.
     let mut raw = String::new();
-    BufReader::new(stream)
-        .read_line(&mut raw)
-        .map_err(|e| format!("failed to read MCP owner response: {e}"))?;
-    let response: OwnerResponse = serde_json::from_str(raw.trim_end())
-        .map_err(|e| format!("malformed MCP owner response: {e}"))?;
+    BufReader::new(stream).read_line(&mut raw).map_err(|e| {
+        OwnerTransportError::ResponseLost(format!("failed to read MCP owner response: {e}"))
+    })?;
+    let response: OwnerResponse = serde_json::from_str(raw.trim_end()).map_err(|e| {
+        OwnerTransportError::MalformedResponse(format!("malformed MCP owner response: {e}"))
+    })?;
     Ok(response.response)
 }
 
@@ -799,6 +859,24 @@ pub mod test_support {
         config: SidecarConfig,
         handler: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) -> Result<OwnerEndpoint, String> {
+        start_owner_thread_with(config, handler, false)
+    }
+
+    /// Like [`start_owner_thread`], but after running `handler` the owner drops
+    /// the socket without writing a response — the FIX-169 "write committed,
+    /// reply lost" shape (client sees `ResponseLost` / connection reset).
+    pub fn start_owner_thread_drop_response(
+        config: SidecarConfig,
+        handler: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Result<OwnerEndpoint, String> {
+        start_owner_thread_with(config, handler, true)
+    }
+
+    fn start_owner_thread_with(
+        config: SidecarConfig,
+        handler: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+        drop_response: bool,
+    ) -> Result<OwnerEndpoint, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("failed to bind test MCP owner socket: {e}"))?;
         let endpoint = OwnerEndpoint {
@@ -814,10 +892,48 @@ pub mod test_support {
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let handler = handler.clone();
-                let _ = handle_owner_stream(&config, &token, stream, move |line| handler(line));
+                if drop_response {
+                    let _ = handle_owner_stream_drop_response(&config, &token, stream, move |line| {
+                        handler(line)
+                    });
+                } else {
+                    let _ = handle_owner_stream(&config, &token, stream, move |line| handler(line));
+                }
             }
         });
         Ok(endpoint)
+    }
+
+    /// Run the handler (so a mutation can commit) then close without a reply.
+    fn handle_owner_stream_drop_response(
+        config: &SidecarConfig,
+        token: &str,
+        stream: TcpStream,
+        handler: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| format!("failed to clone MCP owner stream: {e}"))?,
+        );
+        let mut raw = String::new();
+        reader
+            .read_line(&mut raw)
+            .map_err(|e| format!("failed to read MCP owner request: {e}"))?;
+        let request: OwnerRequest = serde_json::from_str(raw.trim_end())
+            .map_err(|e| format!("malformed MCP owner request: {e}"))?;
+        if request.token == token && super::line_method(&request.line).as_deref() == Some("owner/shutdown")
+        {
+            // Still honor shutdown; tests that drop replies are about tool calls.
+            let _ = config;
+            return Ok(());
+        }
+        if request.token == token {
+            let _ = handler(&request.line);
+        }
+        // Intentionally drop `stream` with no response bytes.
+        drop(stream);
+        Ok(())
     }
 }
 
