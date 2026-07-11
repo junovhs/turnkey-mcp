@@ -59,6 +59,8 @@ pub struct HostInstall {
     pub app_name: String,
     pub servers: Vec<HostServer>,
     pub managed_markdown_body: Option<String>,
+    pub managed_markdown_markers: Option<(String, String)>,
+    pub backup_existing_managed_markdown: bool,
     pub claude_allowed_commands: Vec<String>,
 }
 
@@ -68,6 +70,8 @@ impl HostInstall {
             app_name: app_name.into(),
             servers: Vec::new(),
             managed_markdown_body: None,
+            managed_markdown_markers: None,
+            backup_existing_managed_markdown: false,
             claude_allowed_commands: Vec::new(),
         }
     }
@@ -79,6 +83,26 @@ impl HostInstall {
 
     pub fn managed_markdown_body(mut self, body: impl Into<String>) -> Self {
         self.managed_markdown_body = Some(body.into());
+        self
+    }
+
+    /// Override the delimiters used for the managed CLAUDE.md / AGENTS.md block.
+    ///
+    /// The default product-owned markers remain `mcp-product-infra:begin/end`.
+    /// Consumers with an established ownership contract can retain their own markers
+    /// so an upgrade refreshes the existing block instead of adding a second one.
+    pub fn managed_markdown_markers(
+        mut self,
+        begin: impl Into<String>,
+        end: impl Into<String>,
+    ) -> Self {
+        self.managed_markdown_markers = Some((begin.into(), end.into()));
+        self
+    }
+
+    /// Preserve a one-time `<file>.bak` before modifying an existing instruction file.
+    pub fn backup_existing_managed_markdown(mut self) -> Self {
+        self.backup_existing_managed_markdown = true;
         self
     }
 
@@ -137,57 +161,94 @@ impl HostInstall {
 
     pub fn install_user(&self) -> Result<InstallReport, String> {
         let paths = default_user_config_paths();
+        self.install_user_at(&paths.codex_config, &paths.claude_json)
+            .map(|mut report| {
+                report.root = paths.home;
+                report
+            })
+    }
+
+    /// Materialize user-scope registrations at explicit config paths.
+    ///
+    /// This supports host integrations that supply their own home/config roots in
+    /// tests or embedded environments without mutating the process environment.
+    pub fn install_user_at(
+        &self,
+        codex_config: &Path,
+        claude_json: &Path,
+    ) -> Result<InstallReport, String> {
         let mut files = Vec::new();
         files.push((
-            paths.codex_config.display().to_string(),
-            with_action(&paths.codex_config, || {
-                self.ensure_codex_user_config(&paths.codex_config)
-            })?,
+            codex_config.display().to_string(),
+            with_action(codex_config, || self.ensure_codex_user_config(codex_config))?,
         ));
         files.push((
-            paths.claude_json.display().to_string(),
-            with_action(&paths.claude_json, || {
-                self.ensure_claude_user_config(&paths.claude_json)
-            })?,
+            claude_json.display().to_string(),
+            with_action(claude_json, || self.ensure_claude_user_config(claude_json))?,
         ));
         Ok(InstallReport {
-            root: paths.home,
+            root: codex_config
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
             files,
         })
     }
 
     pub fn remove_user(&self) -> Result<InstallReport, String> {
         let paths = default_user_config_paths();
+        self.remove_user_at(&paths.codex_config, &paths.claude_json)
+            .map(|mut report| {
+                report.root = paths.home;
+                report
+            })
+    }
+
+    /// Remove only owned user-scope registrations at explicit config paths.
+    pub fn remove_user_at(
+        &self,
+        codex_config: &Path,
+        claude_json: &Path,
+    ) -> Result<InstallReport, String> {
         let mut files = Vec::new();
         files.push((
-            paths.codex_config.display().to_string(),
-            with_action(&paths.codex_config, || {
-                self.remove_codex_user_config(&paths.codex_config)
-            })?,
+            codex_config.display().to_string(),
+            with_action(codex_config, || self.remove_codex_user_config(codex_config))?,
         ));
         files.push((
-            paths.claude_json.display().to_string(),
-            with_action(&paths.claude_json, || {
-                self.remove_claude_user_config(&paths.claude_json)
-            })?,
+            claude_json.display().to_string(),
+            with_action(claude_json, || self.remove_claude_user_config(claude_json))?,
         ));
         Ok(InstallReport {
-            root: paths.home,
+            root: codex_config
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
             files,
         })
     }
 
     pub fn readiness(&self, repo_root: &Path) -> Vec<HostReadinessReport> {
         let paths = default_user_config_paths();
+        self.readiness_at(repo_root, &paths.codex_config, &paths.claude_json)
+    }
+
+    /// Report host readiness using explicit user-scope config paths.
+    pub fn readiness_at(
+        &self,
+        repo_root: &Path,
+        codex_config: &Path,
+        claude_json: &Path,
+    ) -> Vec<HostReadinessReport> {
         vec![
             build_readiness(
                 "Claude Code",
-                inspect_claude_config(&paths.claude_json, &self.servers),
+                inspect_claude_config(claude_json, &self.servers),
                 inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers),
             ),
             build_readiness(
                 "Codex",
-                inspect_codex_config(&paths.codex_config, &self.servers),
+                inspect_codex_config(codex_config, &self.servers),
                 inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers),
             ),
         ]
@@ -427,26 +488,40 @@ impl HostInstall {
 
     fn ensure_managed_markdown(&self, path: &Path) -> Result<Materialized, String> {
         let body = self.managed_markdown_body.clone().unwrap_or_default();
-        let block = format!("{MANAGED_BEGIN}\n{body}\n{MANAGED_END}\n");
-        let new_text = match fs::read_to_string(path) {
-            Err(_) => block,
-            Ok(existing) => match (existing.find(MANAGED_BEGIN), existing.find(MANAGED_END)) {
+        let (begin, end) = self
+            .managed_markdown_markers
+            .as_ref()
+            .map(|(begin, end)| (begin.as_str(), end.as_str()))
+            .unwrap_or((MANAGED_BEGIN, MANAGED_END));
+        let block = format!("{begin}\n{body}\n{end}\n");
+        let existing = fs::read_to_string(path).ok();
+        let new_text = match &existing {
+            None => block,
+            Some(existing) => match (existing.find(begin), existing.find(end)) {
                 (Some(start), Some(end_marker_start)) if end_marker_start >= start => {
-                    let end = end_marker_start + MANAGED_END.len();
+                    let end_marker_end = end_marker_start + end.len();
                     let mut out = String::with_capacity(existing.len());
                     out.push_str(&existing[..start]);
                     out.push_str(block.trim_end_matches('\n'));
-                    out.push_str(&existing[end..]);
+                    out.push_str(&existing[end_marker_end..]);
                     out
                 }
                 _ => format!("{block}\n{existing}"),
             },
         };
-        if fs::read_to_string(path)
-            .map(|c| c == new_text)
-            .unwrap_or(false)
-        {
+        if existing.as_ref().is_some_and(|text| text == &new_text) {
             return Ok(Materialized::Wrote);
+        }
+        if self.backup_existing_managed_markdown {
+            if let Some(existing) = &existing {
+                let mut backup = path.as_os_str().to_os_string();
+                backup.push(".bak");
+                let backup = PathBuf::from(backup);
+                if !backup.exists() {
+                    fs::write(&backup, existing)
+                        .map_err(|e| format!("failed to write {}: {e}", backup.display()))?;
+                }
+            }
         }
         fs::write(path, new_text)
             .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
@@ -609,12 +684,31 @@ fn codex_server_toml(server: &HostServer) -> toml::Value {
 }
 
 fn claude_server_json(server: &HostServer) -> Value {
-    json!({
-        "type": "stdio",
-        "command": server.command.clone(),
-        "args": server.args.clone(),
-        "env": server.env.clone()
-    })
+    // Emit the minimal `{command, args}` entry — the implicit stdio `type` and an
+    // empty `env` are omitted so output stays byte-identical to a hand-authored
+    // registration and re-running enable on an existing file is a true no-op.
+    // `env` is included only when the server actually carries variables.
+    // `claude_server_is_owned` treats an absent `type` as stdio, so ownership
+    // detection is unaffected.
+    let mut entry = serde_json::Map::new();
+    entry.insert("command".into(), Value::String(server.command.clone()));
+    entry.insert(
+        "args".into(),
+        Value::Array(server.args.iter().cloned().map(Value::String).collect()),
+    );
+    if !server.env.is_empty() {
+        entry.insert(
+            "env".into(),
+            Value::Object(
+                server
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(entry)
 }
 
 fn codex_server_is_owned(value: &toml::Value, expected: &HostServer) -> bool {
@@ -895,6 +989,63 @@ mod tests {
         assert!(dir.path().join(".mcp.json").exists());
         assert!(dir.path().join(".codex/config.toml").exists());
         assert!(dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn mcp_json_server_entry_is_minimal_and_env_only_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .server(HostServer::stdio("keyed", "keyed", ["mcp"]).env("TOKEN", "abc"))
+            .install_repo(dir.path())
+            .unwrap();
+
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        let plain = &doc["mcpServers"]["todo"];
+        // Byte-parity with a hand-authored entry: no implicit `type`, no empty `env`.
+        assert!(plain.get("type").is_none(), "no default type: {plain}");
+        assert!(plain.get("env").is_none(), "no empty env: {plain}");
+        assert_eq!(plain["command"], "todo");
+        assert_eq!(plain["args"][0], "mcp");
+        // A server that carries variables still emits its env.
+        let keyed = &doc["mcpServers"]["keyed"];
+        assert_eq!(keyed["env"]["TOKEN"], "abc");
+        assert!(keyed.get("type").is_none());
+
+        // Re-running enable is a true no-op on the minimal entry.
+        let again = HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .server(HostServer::stdio("keyed", "keyed", ["mcp"]).env("TOKEN", "abc"))
+            .install_repo(dir.path())
+            .unwrap();
+        let mcp = again.files.iter().find(|(f, _)| f == ".mcp.json").unwrap();
+        assert_eq!(mcp.1, AdapterAction::Unchanged, "re-enable is a no-op");
+    }
+
+    #[test]
+    fn configurable_markers_update_an_existing_block_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        fs::write(
+            &path,
+            "user introduction\n<!-- ishoo:begin -->\nstale\n<!-- ishoo:end -->\nuser footer\n",
+        )
+        .unwrap();
+
+        HostInstall::new("ishoo")
+            .managed_markdown_body("fresh")
+            .managed_markdown_markers("<!-- ishoo:begin -->", "<!-- ishoo:end -->")
+            .install_repo(dir.path())
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "user introduction\n<!-- ishoo:begin -->\nfresh\n<!-- ishoo:end -->\nuser footer\n"
+        );
     }
 
     #[test]
