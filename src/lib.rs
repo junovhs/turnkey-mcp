@@ -7,6 +7,7 @@
 //! optional sidecar ownership, and no-clobber host config installers.
 
 pub mod adapters;
+pub mod agent_guard;
 pub mod capture;
 pub mod manifest;
 pub mod registry;
@@ -17,7 +18,8 @@ pub mod sidecar;
 pub mod types;
 
 pub use adapters::{
-    AdapterAction, HostConfigFact, HostInstall, HostReadinessReport, HostServer, InstallReport,
+    AdapterAction, ClaudeHook, HostConfigFact, HostInstall, HostReadinessReport, HostServer,
+    InstallReport,
 };
 pub use manifest::{
     HandlerCommand, HandlerRequest, HandlerResponse, Manifest, ManifestMutation, ManifestTool,

@@ -54,6 +54,17 @@ impl HostServer {
     }
 }
 
+/// A Claude Code hook entry the install materializes into the repo's
+/// `.claude/settings.local.json` — e.g. a PreToolUse guard the app's binary
+/// serves (`ishoo agent-guard`). Matched-by-command for ownership, so foreign
+/// hooks on the same event/matcher are never touched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeHook {
+    pub event: String,
+    pub matcher: String,
+    pub command: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct HostInstall {
     pub app_name: String,
@@ -62,6 +73,7 @@ pub struct HostInstall {
     pub managed_markdown_markers: Option<(String, String)>,
     pub backup_existing_managed_markdown: bool,
     pub claude_allowed_commands: Vec<String>,
+    pub claude_hooks: Vec<ClaudeHook>,
 }
 
 impl HostInstall {
@@ -73,6 +85,7 @@ impl HostInstall {
             managed_markdown_markers: None,
             backup_existing_managed_markdown: false,
             claude_allowed_commands: Vec::new(),
+            claude_hooks: Vec::new(),
         }
     }
 
@@ -108,6 +121,24 @@ impl HostInstall {
 
     pub fn claude_allow(mut self, command: impl Into<String>) -> Self {
         self.claude_allowed_commands.push(command.into());
+        self
+    }
+
+    /// Register a Claude Code hook to materialize into the repo's
+    /// `.claude/settings.local.json` (e.g. `("PreToolUse", "Bash", "app agent-guard")`).
+    /// Merged idempotently: identified by its exact command string, appended to an
+    /// existing matcher group when one exists, and foreign hooks are never modified.
+    pub fn claude_hook(
+        mut self,
+        event: impl Into<String>,
+        matcher: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        self.claude_hooks.push(ClaudeHook {
+            event: event.into(),
+            matcher: matcher.into(),
+            command: command.into(),
+        });
         self
     }
 
@@ -480,6 +511,9 @@ impl HostInstall {
             if !allow.iter().any(|v| v.as_str() == Some(command)) {
                 allow.push(Value::String(command.clone()));
             }
+        }
+        if let Err(skipped) = merge_claude_hooks(root, &self.claude_hooks) {
+            return Ok(skipped);
         }
         fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
         write_json(&path, &doc)?;
@@ -901,6 +935,64 @@ fn fact(state: &str, path: &Path, detail: Option<String>) -> HostConfigFact {
     }
 }
 
+/// Merge the install's Claude hooks into a settings document root. A hook is
+/// identified by its exact command string; existing matcher groups gain the
+/// command, foreign hooks and unknown keys are preserved byte-for-byte, and a
+/// structurally alien `hooks` shape skips the file rather than clobbering it.
+fn merge_claude_hooks(
+    root: &mut serde_json::Map<String, Value>,
+    hooks: &[ClaudeHook],
+) -> Result<(), Materialized> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let hooks_root = root.entry("hooks").or_insert_with(|| json!({}));
+    let Some(hooks_root) = hooks_root.as_object_mut() else {
+        return Err(Materialized::Skipped(
+            "Claude `hooks` is not an object".to_string(),
+        ));
+    };
+    for hook in hooks {
+        let event = hooks_root.entry(hook.event.clone()).or_insert_with(|| json!([]));
+        let Some(groups) = event.as_array_mut() else {
+            return Err(Materialized::Skipped(format!(
+                "Claude `hooks.{}` is not an array",
+                hook.event
+            )));
+        };
+        let already_present = groups.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("command").and_then(|v| v.as_str()) == Some(&hook.command)
+                    })
+                })
+        });
+        if already_present {
+            continue;
+        }
+        let entry = json!({ "type": "command", "command": hook.command });
+        let matcher_group = groups.iter_mut().find(|group| {
+            group.get("matcher").and_then(|v| v.as_str()) == Some(hook.matcher.as_str())
+                && group.get("hooks").is_some_and(Value::is_array)
+        });
+        match matcher_group {
+            Some(group) => {
+                // Checked is_array above; push into the existing matcher group.
+                group
+                    .get_mut("hooks")
+                    .and_then(|v| v.as_array_mut())
+                    .expect("matcher group hooks is an array")
+                    .push(entry);
+            }
+            None => groups.push(json!({ "matcher": hook.matcher, "hooks": [entry] })),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_claude_gitignore(repo_root: &Path) -> Result<Materialized, String> {
     let dir = repo_root.join(".claude");
     let path = dir.join(".gitignore");
@@ -1045,6 +1137,91 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "user introduction\n<!-- ishoo:begin -->\nfresh\n<!-- ishoo:end -->\nuser footer\n"
+        );
+    }
+
+    #[test]
+    fn claude_hook_is_materialized_idempotently_into_repo_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let install = HostInstall::new("todo")
+            .server(HostServer::stdio("todo", "todo", ["mcp"]))
+            .claude_hook("PreToolUse", "Bash", "todo agent-guard");
+
+        install.install_repo(dir.path()).unwrap();
+        let path = dir.path().join(".claude/settings.local.json");
+        let doc: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "todo agent-guard"
+        );
+        assert_eq!(doc["hooks"]["PreToolUse"][0]["hooks"][0]["type"], "command");
+
+        // Second run is byte-identical (no duplicate hook entries).
+        let before = fs::read(&path).unwrap();
+        let report = install.install_repo(dir.path()).unwrap();
+        let settings = report
+            .files
+            .iter()
+            .find(|(f, _)| f == ".claude/settings.local.json")
+            .unwrap();
+        assert_eq!(settings.1, AdapterAction::Unchanged);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn claude_hook_joins_an_existing_matcher_group_and_preserves_foreign_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude/settings.local.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"my-linter"}]},{"matcher":"Write","hooks":[{"type":"command","command":"fmt"}]}],"Stop":[{"hooks":[{"type":"command","command":"notify"}]}]},"keep":true}"#,
+        )
+        .unwrap();
+
+        HostInstall::new("todo")
+            .claude_hook("PreToolUse", "Bash", "todo agent-guard")
+            .install_repo(dir.path())
+            .unwrap();
+
+        let doc: Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        // Joined the existing Bash group, after the user's hook.
+        let bash_hooks = doc["hooks"]["PreToolUse"][0]["hooks"].as_array().unwrap();
+        assert_eq!(bash_hooks[0]["command"], "my-linter");
+        assert_eq!(bash_hooks[1]["command"], "todo agent-guard");
+        // Foreign matcher group, foreign event, and unknown keys preserved.
+        assert_eq!(doc["hooks"]["PreToolUse"][1]["matcher"], "Write");
+        assert_eq!(doc["hooks"]["Stop"][0]["hooks"][0]["command"], "notify");
+        assert_eq!(doc["keep"], true);
+    }
+
+    #[test]
+    fn claude_hook_skips_an_alien_hooks_shape_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let original = r#"{"hooks":"custom-string-shape"}"#;
+        fs::write(dir.path().join(".claude/settings.local.json"), original).unwrap();
+
+        let report = HostInstall::new("todo")
+            .claude_hook("PreToolUse", "Bash", "todo agent-guard")
+            .install_repo(dir.path())
+            .unwrap();
+        let settings = report
+            .files
+            .iter()
+            .find(|(f, _)| f == ".claude/settings.local.json")
+            .unwrap();
+        assert!(matches!(settings.1, AdapterAction::Skipped(_)));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap(),
+            original,
+            "alien shape left untouched"
         );
     }
 
