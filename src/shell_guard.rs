@@ -4,10 +4,10 @@
 //! agent host offers them. The lowest common denominator of *every* agent CLI
 //! (Claude Code, Codex, Grok, OpenCode, Kilocode, a human terminal) is that
 //! shell commands resolve binaries through `$PATH` of the login environment.
-//! This module materializes a tiny POSIX-sh `rg` shim into an app-owned shim
-//! directory and manages a marker-delimited block in the user's shell startup
-//! files that prepends that directory to `PATH` — so the same guard fires no
-//! matter which host spawned the shell.
+//! This module materializes a tiny platform-native `rg` shim into an app-owned
+//! shim directory. POSIX callers pair it with a marker-delimited shell-startup
+//! block; Windows callers pair the `.cmd` shim with a user-scoped `Path` entry.
+//! In either case the same guard fires no matter which host spawned the shell.
 //!
 //! Safety posture:
 //! - **Fail-open shim**: the only path that blocks is the guard binary
@@ -75,6 +75,38 @@ exit 127
     )
 }
 
+/// The Windows `cmd.exe` `rg` shim. The caller installs this as `rg.cmd` in a
+/// directory that is prepended to the user's `Path`.
+///
+/// The shim deliberately finds `rg.exe` rather than calling `rg`: that avoids
+/// recursively resolving itself while still preserving ripgrep's exit code and
+/// argv. `where rg.exe` also lets a shim directory precede the real ripgrep
+/// directory without knowing where the latter was installed.
+pub fn windows_rg_shim_script(app_name: &str, guard_bin: &str) -> String {
+    format!(
+        r#"@echo off
+rem {app_name} shell-guard shim for ripgrep.
+rem Blocks known output-corrupting flag misuse, then hands through to real rg.exe.
+rem Fails OPEN: only the guard's dedicated exit code blocks execution.
+setlocal DisableDelayedExpansion
+set "GUARD={guard_bin}"
+if not exist "%GUARD%" goto find_real
+"%GUARD%" agent-guard --check-rg -- %*
+rem `if errorlevel` is >=, so test the range around 86 to require an exact match.
+if errorlevel 87 goto find_real
+if errorlevel 86 exit /b 2
+
+:find_real
+for /f "delims=" %%R in ('where rg.exe 2^>nul') do (
+  "%%~fR" %*
+  exit /b
+)
+echo {app_name} shell-guard: real ripgrep not found on PATH 1>&2
+exit /b 127
+"#
+    )
+}
+
 /// Idempotently write the executable `rg` shim into `shim_dir`.
 pub fn ensure_rg_shim(shim_dir: &Path, app_name: &str, guard_bin: &str) -> Result<(), String> {
     let script = rg_shim_script(app_name, guard_bin);
@@ -89,6 +121,22 @@ pub fn ensure_rg_shim(shim_dir: &Path, app_name: &str, guard_bin: &str) -> Resul
     ensure_executable(&path)
 }
 
+/// Idempotently write the Windows `rg.cmd` shim into `shim_dir`.
+pub fn ensure_windows_rg_shim(
+    shim_dir: &Path,
+    app_name: &str,
+    guard_bin: &str,
+) -> Result<(), String> {
+    let script = windows_rg_shim_script(app_name, guard_bin);
+    let path = shim_dir.join("rg.cmd");
+    if fs::read_to_string(&path).ok().as_deref() == Some(script.as_str()) {
+        return Ok(());
+    }
+    fs::create_dir_all(shim_dir)
+        .map_err(|e| format!("failed to create {}: {e}", shim_dir.display()))?;
+    fs::write(&path, script).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
 /// Remove the shim (and its directory when that leaves it empty). Missing
 /// pieces are a no-op.
 pub fn remove_rg_shim(shim_dir: &Path) -> Result<(), String> {
@@ -101,6 +149,50 @@ pub fn remove_rg_shim(shim_dir: &Path) -> Result<(), String> {
         let _ = fs::remove_dir(shim_dir);
     }
     Ok(())
+}
+
+/// Remove the Windows `rg.cmd` shim (and its directory when that leaves it
+/// empty). Missing pieces are a no-op.
+pub fn remove_windows_rg_shim(shim_dir: &Path) -> Result<(), String> {
+    let path = shim_dir.join("rg.cmd");
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+    }
+    if fs::read_dir(shim_dir).is_ok_and(|mut d| d.next().is_none()) {
+        let _ = fs::remove_dir(shim_dir);
+    }
+    Ok(())
+}
+
+/// Return `path` with `shim_dir` prepended as one Windows `Path` segment.
+///
+/// The comparison is case-insensitive and ignores a trailing separator, as
+/// Windows path identity does. Existing duplicates are removed so enabling is
+/// idempotent and leaves exactly one Ishoo-owned segment.
+pub fn windows_path_with_shim(path: &str, shim_dir: &Path) -> String {
+    let shim = shim_dir.display().to_string();
+    let mut parts = vec![shim.clone()];
+    parts.extend(
+        path.split(';')
+            .filter(|part| !part.is_empty() && !same_windows_path(part, &shim))
+            .map(str::to_owned),
+    );
+    parts.join(";")
+}
+
+/// Return `path` with every exact occurrence of `shim_dir` removed, preserving
+/// all non-Ishoo user PATH segments byte-for-byte.
+pub fn windows_path_without_shim(path: &str, shim_dir: &Path) -> String {
+    let shim = shim_dir.display().to_string();
+    path.split(';')
+        .filter(|part| !same_windows_path(part, &shim))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn same_windows_path(left: &str, right: &str) -> bool {
+    left.trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
 }
 
 #[cfg(unix)]
@@ -211,6 +303,56 @@ mod tests {
         remove_rg_shim(&shim_dir).unwrap();
         assert!(!path.exists());
         assert!(!shim_dir.exists(), "empty shim dir removed");
+    }
+
+    #[test]
+    fn windows_shim_is_idempotent_and_only_blocks_the_dedicated_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        ensure_windows_rg_shim(&shim_dir, "todo", r"C:\Program Files\todo\todo.exe").unwrap();
+        let path = shim_dir.join("rg.cmd");
+        let script = fs::read_to_string(&path).unwrap();
+        assert!(script.starts_with("@echo off"));
+        assert!(script.contains(r#"set "GUARD=C:\Program Files\todo\todo.exe"#));
+        assert!(script.contains("agent-guard --check-rg -- %*"));
+        assert!(script.contains("where rg.exe"));
+        assert!(script.contains("if errorlevel 87 goto find_real"));
+        assert!(script.contains("if errorlevel 86 exit /b 2"));
+
+        let before = fs::read(&path).unwrap();
+        ensure_windows_rg_shim(&shim_dir, "todo", r"C:\Program Files\todo\todo.exe").unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "second run is byte-identical"
+        );
+
+        remove_windows_rg_shim(&shim_dir).unwrap();
+        assert!(!path.exists());
+        assert!(!shim_dir.exists(), "empty shim dir removed");
+    }
+
+    #[test]
+    fn windows_path_helpers_are_idempotent_and_remove_only_the_owned_segment() {
+        let shim = Path::new(r"C:\Users\Juno\AppData\Local\ishoo\shims");
+        let original = r"C:\Tools;C:\Users\Juno\AppData\Local\Ishoo\Shims\;C:\Tools2";
+        let enabled = windows_path_with_shim(original, shim);
+        assert_eq!(
+            enabled,
+            r"C:\Users\Juno\AppData\Local\ishoo\shims;C:\Tools;C:\Tools2"
+        );
+        assert_eq!(windows_path_with_shim(&enabled, shim), enabled);
+        assert_eq!(
+            windows_path_without_shim(&enabled, shim),
+            r"C:\Tools;C:\Tools2"
+        );
+        assert_eq!(
+            windows_path_without_shim(
+                r"C:\ishoo\shims-extra;C:\ishoo\shims",
+                Path::new(r"C:\ishoo\shims")
+            ),
+            r"C:\ishoo\shims-extra"
+        );
     }
 
     #[test]
