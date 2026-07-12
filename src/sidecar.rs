@@ -27,9 +27,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Read/write timeout on an ACCEPTED owner-side connection. A stalled or
+/// vanished client must never park an owner thread (and its socket) forever —
+/// that is a cumulative handle leak in a long-lived owner (MCP-67).
+const OWNER_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a retiring owner waits for in-flight connection threads to finish
+/// writing their responses before exiting. A committed mutation's ack must not
+/// be torn down with the process (MCP-67: "write may have committed", os error
+/// 10054). Kept well under `retire_stale_owner`'s 3s exit deadline in the
+/// common case — in-flight work is normally milliseconds.
+const RETIRE_INFLIGHT_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OwnerEndpoint {
@@ -339,26 +352,86 @@ pub fn run_owner_server(
     let handler = Arc::new(handler);
     let idle_timeout = config.effective_idle_timeout();
     let mut last_activity = Instant::now();
-    loop {
+    // MCP-67: never `exit(0)` out from under a connection thread. Both exit
+    // paths (idle-reap and the owner/shutdown handoff) go through the same
+    // retirement choreography: stop accepting, let in-flight threads finish
+    // writing their responses, drain, then exit. A response torn down with the
+    // process is the "write may have committed" (os error 10054) client error.
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let retiring = Arc::new(AtomicBool::new(false));
+    while !retiring.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 last_activity = Instant::now();
+                // The accepted socket inherits the listener's non-blocking mode
+                // on some platforms (Windows/BSD, not Linux). A non-blocking
+                // connection socket makes read_line/response writes fail with
+                // WouldBlock mid-request, dropping the socket — the client sees
+                // a connection reset (the MCP-67 10054 class). Force blocking,
+                // and bound each I/O so a stalled client cannot leak the
+                // thread+socket forever.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(OWNER_STREAM_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(OWNER_STREAM_IO_TIMEOUT));
                 let token = endpoint.token.clone();
                 let handler = handler.clone();
                 let config = config.clone();
+                let guard = InflightGuard::enter(&inflight);
+                let retire = retiring.clone();
                 thread::spawn(move || {
-                    let _ = handle_owner_stream(&config, &token, stream, move |line| handler(line));
+                    let _guard = guard;
+                    let _ = handle_owner_stream(&config, &token, stream, &retire, move |line| {
+                        handler(line)
+                    });
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if last_activity.elapsed() >= idle_timeout {
-                    config.run_drain();
-                    std::process::exit(0);
+                    // accept() returned WouldBlock this instant, so no client
+                    // is waiting in the backlog — begin retirement now.
+                    break;
                 }
-                thread::sleep(idle_poll_interval(idle_timeout));
+                // Sleep in short slices so an owner/shutdown request retires
+                // the loop promptly (retire_stale_owner waits only ~3s).
+                let mut remaining = idle_poll_interval(idle_timeout);
+                while !remaining.is_zero() && !retiring.load(Ordering::SeqCst) {
+                    let slice = remaining.min(Duration::from_millis(25));
+                    thread::sleep(slice);
+                    remaining -= slice;
+                }
             }
             Err(_) => thread::sleep(Duration::from_millis(10)),
         }
+    }
+    // Stop new handshakes first, then wait (bounded) for in-flight responses.
+    drop(listener);
+    let wait_deadline = Instant::now() + RETIRE_INFLIGHT_WAIT;
+    while inflight.load(Ordering::SeqCst) > 0 && Instant::now() < wait_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    config.run_drain();
+    std::process::exit(0);
+}
+
+/// Counts live owner-connection threads so retirement can wait for their
+/// responses to flush. Entered on the accept thread BEFORE the connection
+/// thread spawns (no under-count window) and released on drop, panic included.
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InflightGuard {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self {
+            counter: counter.clone(),
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -432,10 +505,13 @@ pub fn send_line(
         token: endpoint.token.clone(),
         line: line.to_string(),
     };
-    serde_json::to_writer(&mut stream, &request).map_err(|e| {
+    // One buffered write: serializing straight into the socket emits the frame
+    // as many small segments, widening the mid-frame failure window (MCP-67).
+    let mut frame = serde_json::to_string(&request).map_err(|e| {
         OwnerTransportError::Write(format!("failed to encode MCP owner request: {e}"))
     })?;
-    stream.write_all(b"\n").map_err(|e| {
+    frame.push('\n');
+    stream.write_all(frame.as_bytes()).map_err(|e| {
         OwnerTransportError::Write(format!("failed to write MCP owner request: {e}"))
     })?;
     stream.flush().map_err(|e| {
@@ -458,6 +534,7 @@ fn handle_owner_stream(
     config: &SidecarConfig,
     token: &str,
     stream: TcpStream,
+    retiring: &AtomicBool,
     handler: impl Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(
@@ -474,19 +551,15 @@ fn handle_owner_stream(
 
     // Graceful upgrade handoff: a token-authenticated `owner/shutdown` retires
     // this owner so a newer-build client can elect a replacement. Ack first (so
-    // the client sees a clean handoff), then drain any in-flight serialized
-    // work, and exit — the OS releases the singleton lock on exit.
+    // the client sees a clean handoff), then signal retirement — the accept
+    // loop stops taking connections, waits for in-flight responses (MCP-67),
+    // drains, and exits, releasing the singleton lock.
     if request.token == token && line_method(&request.line).as_deref() == Some("owner/shutdown") {
+        let _ = config;
         let ack = Some(r#"{"jsonrpc":"2.0","result":{"status":"shutting_down"}}"#.to_string());
-        let mut writer = stream;
-        serde_json::to_writer(&mut writer, &OwnerResponse { response: ack })
-            .map_err(|e| format!("failed to encode MCP owner response: {e}"))?;
-        writer
-            .write_all(b"\n")
-            .map_err(|e| format!("failed to write MCP owner response: {e}"))?;
-        let _ = writer.flush();
-        config.run_drain();
-        std::process::exit(0);
+        write_owner_response(stream, OwnerResponse { response: ack })?;
+        retiring.store(true, Ordering::SeqCst);
+        return Ok(());
     }
 
     let response = if request.token == token {
@@ -499,12 +572,22 @@ fn handle_owner_stream(
         ))
     };
 
-    let mut writer = stream;
-    serde_json::to_writer(&mut writer, &OwnerResponse { response })
+    write_owner_response(stream, OwnerResponse { response })
+}
+
+/// Send one owner response as a single buffered write. Serializing straight
+/// into the socket emits the frame as many small segments, widening the
+/// mid-frame failure window on the client (MCP-67); one write, then flush.
+fn write_owner_response(mut stream: TcpStream, response: OwnerResponse) -> Result<(), String> {
+    let mut frame = serde_json::to_string(&response)
         .map_err(|e| format!("failed to encode MCP owner response: {e}"))?;
-    writer
-        .write_all(b"\n")
+    frame.push('\n');
+    stream
+        .write_all(frame.as_bytes())
         .map_err(|e| format!("failed to write MCP owner response: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("failed to flush MCP owner response: {e}"))?;
     Ok(())
 }
 
@@ -885,6 +968,7 @@ pub mod test_support {
         let token = endpoint.token.clone();
         let handler = Arc::new(handler);
         thread::spawn(move || {
+            let retiring = AtomicBool::new(false);
             for stream in listener.incoming().flatten() {
                 let handler = handler.clone();
                 if drop_response {
@@ -893,7 +977,12 @@ pub mod test_support {
                             handler(line)
                         });
                 } else {
-                    let _ = handle_owner_stream(&config, &token, stream, move |line| handler(line));
+                    let _ = handle_owner_stream(&config, &token, stream, &retiring, move |line| {
+                        handler(line)
+                    });
+                }
+                if retiring.load(Ordering::SeqCst) {
+                    break;
                 }
             }
         });
