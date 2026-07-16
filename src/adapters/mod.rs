@@ -285,6 +285,31 @@ impl HostInstall {
         ]
     }
 
+    /// Report readiness when user/global registrations intentionally launch a
+    /// different server shape than repository adapters (for example, a
+    /// machine-wide hub versus a repository-scoped server). `self` describes
+    /// the repository adapter; `user_install` describes the user registration.
+    pub fn readiness_at_with_user_install(
+        &self,
+        user_install: &HostInstall,
+        repo_root: &Path,
+        codex_config: &Path,
+        claude_json: &Path,
+    ) -> Vec<HostReadinessReport> {
+        vec![
+            build_readiness(
+                "Claude Code",
+                inspect_claude_config(claude_json, &user_install.servers),
+                inspect_claude_config(&repo_root.join(".mcp.json"), &self.servers),
+            ),
+            build_readiness(
+                "Codex",
+                inspect_codex_config(codex_config, &user_install.servers),
+                inspect_codex_config(&repo_root.join(".codex/config.toml"), &self.servers),
+            ),
+        ]
+    }
+
     fn ensure_mcp_json(&self, repo_root: &Path) -> Result<Materialized, String> {
         let path = repo_root.join(".mcp.json");
         let mut doc = match fs::read_to_string(&path) {
@@ -1241,5 +1266,39 @@ mod tests {
             .find(|(path, _)| path == ".codex/config.toml")
             .unwrap();
         assert!(matches!(codex.1, AdapterAction::Skipped(_)));
+    }
+
+    #[test]
+    fn readiness_accepts_distinct_user_and_repository_server_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let codex = dir.path().join("codex.toml");
+        let claude = dir.path().join("claude.json");
+        let repo_install =
+            || HostInstall::new("todo").server(HostServer::stdio("todo", "todo", ["mcp"]));
+        let user_install =
+            || HostInstall::new("todo").server(HostServer::stdio("todo", "todo", ["mcp", "--hub"]));
+
+        user_install().install_user_at(&codex, &claude).unwrap();
+        let global = repo_install().readiness_at_with_user_install(
+            &user_install(),
+            dir.path(),
+            &codex,
+            &claude,
+        );
+        assert!(global.iter().all(|report| report.ready));
+        assert!(global
+            .iter()
+            .all(|report| report.effective_source == "user"));
+
+        repo_install().install_repo(dir.path()).unwrap();
+        let both = repo_install().readiness_at_with_user_install(
+            &user_install(),
+            dir.path(),
+            &codex,
+            &claude,
+        );
+        assert!(both.iter().all(|report| report.ready));
+        assert!(both.iter().all(|report| report.effective_source == "both"));
     }
 }
